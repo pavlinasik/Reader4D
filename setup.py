@@ -8,7 +8,7 @@ Created on Mon Sep  1 11:50:24 2025
 import setuptools
 
 def get_version():
-    with(open("src/__init__.py", "r")) as fh:
+    with(open("src/Reader4D/__init__.py", "r")) as fh:
         for line in fh:
             if line.startswith("__version__"):
                 delim = '"' if '"' in line else "'"
