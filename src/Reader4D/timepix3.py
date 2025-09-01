@@ -23,20 +23,89 @@ except Exception:
             
 
 # Import data types
-from dtypes import TP3_BIN_DESCRIPTOR_DTYPE as BIN_DESCRIPTOR_DTYPE
-from dtypes import TP3_ACQ_DATA_PACKET_DTYPE as ACQ_DATA_PACKET_DTYPE
-from dtypes import TP3_DTYPE_MAP as _DTYPE_MAP
+from .dtypes import TP3_BIN_DESCRIPTOR_DTYPE as BIN_DESCRIPTOR_DTYPE
+from .dtypes import TP3_ACQ_DATA_PACKET_DTYPE as ACQ_DATA_PACKET_DTYPE
+from .dtypes import TP3_DTYPE_MAP as _DTYPE_MAP
+
+# Import other Reader4D modules:
+import Reader4D.convertor as r4dConv
+
 
     
 class CSRTriplet:
+    """
+    Convenience wrapper for loading a 4D-STEM dataset stored as a CSR triplet
+    (`indptr.raw`, `indices.raw`, `values.raw`), validating it, inferring scan
+    and detector dimensions, and optionally previewing random diffractograms.
+
+    Parameters
+    ----------
+    in_dir : str or pathlib.Path
+        Directory containing the CSR triplet files (and optionally a TOML
+        sidecar). Filenames are given by `indptr`, `indices`, and `data`.
+    out_dir : str or pathlib.Path, optional
+        Output directory for derived artifacts/figures. Defaults to `in_dir`.
+    indptr : str, default "indptr.raw"
+        Filename of the CSR row pointer array (int64), length = n_frames + 1.
+    indices : str, default "indices.raw"
+        Filename of the CSR column indices (detector addresses; int32), 
+        length = nnz.
+    data : str, default "values.raw"
+        Filename of the CSR data values (counts or iToT; int32), length = nnz.
+    scan_dims : tuple[int, int] or None, optional
+        (width, height) of the scan grid. If None, inferred from header.
+        Internally stored as `self.SCAN_DIMS`.
+    det_dims : tuple[int, int] or None, optional
+        (det_width, det_height) of the detector grid. If None, inferred from 
+        header. Internally stored as `self.DET_DIMS`.
+    h5file : str
+        Filename of a .h5 export for MATLAB to the out_dir. If None, no export 
+        is done. Default is None.
+    cmap : str, default "gray"
+        Colormap used for preview figures.
+    show : bool, default True
+        If True, display a few random diffractograms after loading.
+    progress : bool, default True
+        If True, show tqdm progress while loading/prefetching raw arrays.
+    verbose : int, default 1
+        Verbosity level; >0 prints basic status messages.
+    return_header : bool, default True
+        If True, `CSRLoader` returns a parsed header/stats dict as `self.header`.
+    print_header : bool, default True
+        If True and a header is available, pretty-prints it after loading.
+
+    Attributes
+    ----------
+    packets : np.ndarray
+        Structured array with fields ``address``, ``count``, ``itot`` (types 
+        depend on loader config). One row per nonzero/packet.
+    descriptors : np.ndarray
+        Structured array with fields ``offset`` (uint64) and ``packet_count`` 
+        (uint32), one row per scan pixel (frame).
+    header : dict or None
+        Parsed header/stats (if `return_header=True`), including shapes and 
+        dtypes. When present, `nav_shape` (H, W) and `sig_shape` (Hdet, Wdet) 
+        are used to fill `self.SCAN_DIMS` and `self.DET_DIMS` (note the class
+        stores scan as (W, H)).
+    SCAN_DIMS : tuple[int, int]
+        (width, height) of the scan grid, provided or inferred from header.
+    DET_DIMS : tuple[int, int]
+        (det_width, det_height) of the detector grid, provided or inferred.
+    out_dir : pathlib.Path
+        Destination directory used to store outputs (created if missing).
+    example : dict or any
+        Handle/object returned by `show_random_diffractograms` when `show=True`.
+
+    """    
     def __init__(self,
                 in_dir, 
-                out_dir,
+                out_dir       = None,
                 indptr        = "indptr.raw",
                 indices       = "indices.raw",
                 data          = "values.raw",
                 scan_dims     = None,
                 det_dims      = None,
+                h5file        = None,
                 cmap          = "gray",
                 show          = True,
                 progress      = True,
@@ -52,12 +121,18 @@ class CSRTriplet:
         
         ## Initialize input attributes ---------------------------------------
         self.in_dir = in_dir
-        self.out_dir = out_dir
+        
+        if out_dir is None:
+            self.out_dir = self.in_dir
+        else:
+            self.out_dir = out_dir
+            
         self.triplet1 = indptr
         self.triplet2 = indices
         self.triplet3 = data
         self.SCAN_DIMS = scan_dims
         self.DET_DIMS = det_dims
+        self.h5file = h5file
         self.cmap = cmap
         self.show = show
         self.progress = progress
@@ -89,12 +164,20 @@ class CSRTriplet:
             # (b) detector dimensions
             self.DET_DIMS = self.header['sig_shape']
 
-            # Define output folder (change if needed)
-            output_dir = os.path.join(
-                os.path.dirname(self.out_dir), "output_TPX3")
-            os.makedirs(output_dir, exist_ok=True)
+        # Define output folder (change if needed) -----------------------------
+        self.output_dir = os.path.join(
+            os.path.dirname(self.out_dir), "output_TPX3")
+        os.makedirs(self.output_dir, exist_ok=True)
         
-        # Show ranfom diffractograns optionally
+        # Convert to a .h5 file for MATLAB optionally -------------------------
+        if self.h5file is not None:
+            r4dConv.diff2hdf5(
+                self.packets, 
+                self.descriptors, 
+                filename=self.output_dir+"\\"+self.h5file,
+                verbose=self.verbose)
+            
+        # Show ranfom diffractograns optionally -------------------------------
         if show:
             if verbose:
                 print("[INFO] Displaying sample diffractograms...")
@@ -104,9 +187,10 @@ class CSRTriplet:
                 descriptors=self.descriptors, 
                 scan_dims=self.SCAN_DIMS,
                 )
-            
-            
         
+        if verbose:
+            print("[DONE]")
+            
             
     def CSRLoader(self,
                     indptr = "indptr.raw",
@@ -116,6 +200,63 @@ class CSRTriplet:
                     progress=True,
                     prefetch_mb=256,
                     return_header=False):
+        """
+        Load a CSR triplet described by a sidecar TOML file and convert it to 
+        your downstream-friendly representation:
+          - descriptors: structured array with fields
+            ('offset': uint64, 'packet_count': uint32)
+            1 row per scan pixel/frame  
+          - packets: structured array with fields
+            ('address': uint32, 'count': uint32, 'itot': uint32)
+            1 entry per nonzero
+
+        The CSR arrays are memory-mapped (no upfront copy). Optionally, 
+        the function sequentially prefetches each memmap in large blocks.
+
+        Parameters
+        ----------
+        folder : str
+            Directory containing the CSR files and a matching *.toml produced 
+            by the acquisition script. The TOML is expected to include:
+
+            - [params]: may define nav_shape = [H, W], sig_shape = [Hdet,Wdet],
+              optional filetype, and optional acquisition metadata 
+              (e.g., dwell_time_ns,threshold, bias).
+            - [raw_csr]: file names and dtypes for the CSR triplet, e.g.
+              indptr_file, indices_file, data_file,
+              indptr_dtype, indices_dtype, data_dtype.
+
+        values_role : {"count", "itot"}, optional
+            How to map values.raw into the output packet fields. 
+            If "count", values are written to packets['count'] and 
+            packets['itot'] is zeroed. 
+            If "itot", values go to packets['itot'] and packets['count'] is
+            zeroed. 
+            Default is "count".
+        progress : bool, optional
+            If True, prefetch each memmap with a tqdm progress bar. 
+            Default True.
+        prefetch_mb : int, optional
+            Block size (MiB) used for prefetching sequential reads. Larger 
+            values reduce Python overhead but increase each I/O burst. 
+            Default 256.
+        return_header : bool, optional
+            If True, also return a friendly header/stats dict assembled from
+            the TOML and derived CSR statistics (via _normalize_header). 
+            Default False.
+
+        Returns
+        -------
+        packets : numpy.ndarray
+            Structured array of shape (nnz,) with dtype compatible with your
+            acq_data_packet_dtype; fields: 'address', 'count', 'itot'.
+        descriptors : numpy.ndarray
+            Structured array of shape (n_frames,) with dtype compatible with 
+            your bin_descriptor_dtype; fields: 'offset', 'packet_count'.
+        header : dict, optional
+            Only if return_header=True; a flat dict suitable for printing,
+            including shapes, byte sizes, and simple stats.
+        """
         
         # Initialize variables
         folder = self.in_dir
@@ -634,3 +775,8 @@ class CSRTriplet:
         
         # Return diffractogram ----------------------------------------------------
         return diffraction_image, count_sum
+
+
+class ADVBdataset:
+    # place holder 
+    pass    
