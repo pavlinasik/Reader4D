@@ -9,3 +9,4 @@ __version__ = "0.0.1"
 
 
 import timepix3
+import dtypes
