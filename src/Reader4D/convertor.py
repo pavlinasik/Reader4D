@@ -8,7 +8,8 @@ import os
 import numpy as np
 import h5py
 from tqdm import tqdm
-from Reader4D.timepix3.CSRTriplet import get_diffractogram
+import Reader4D.detectors as det
+
 
 def save_all_diffractograms(packets, descriptors, output_path,
                             scan_dims=(1024, 768)):
@@ -53,7 +54,7 @@ def save_all_diffractograms(packets, descriptors, output_path,
     # Loop through every pattern index
     for i in tqdm(range(num_patterns), desc="Saving Diffractograms"):
         # 1. Reconstruct the diffractogram for the current index
-        diff_pattern, _ = get_diffractogram(
+        diff_pattern, _ = det.timepix3.CSRLoader.get_diffractogram(
             packets, descriptors, i, scan_dims)
         
         # 2. Save the resulting array to a .dat file

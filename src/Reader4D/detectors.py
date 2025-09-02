@@ -32,7 +32,7 @@ import Reader4D.convertor as r4dConv
 
 
     
-class timepix3:
+class Timepix3:
     """
     Convenience wrapper for loading a 4D-STEM dataset stored as a CSR triplet
     (`indptr.raw`, `indices.raw`, `values.raw`), validating it, inferring scan
@@ -93,7 +93,8 @@ class timepix3:
                 progress      = True,
                 verbose       = 1,
                 return_header = True,
-                print_header  = True
+                print_header  = True,
+                micrographs   = False,
                 ):
         
         ######################################################################
@@ -174,6 +175,35 @@ class timepix3:
                 scan_dims=self.SCAN_DIMS,
                 )
         
+        if micrographs:
+            if self.verbose:
+                print("[INFO] Reconstructing Hit Count and iToT micrographs...")
+            self.count, self.itot = self.get_count_itot(
+                packets=self.packets,
+                descriptors=self.descriptors,
+                scan_dims=self.SCAN_DIMS,
+                show=self.show,
+                cmap=self.cmap
+            )
+
+            # Save Hit Count and iToT images
+            if self.count is not None:
+                plt.imsave(os.path.join(
+                    self.output_dir, "hit_count.png"), 
+                    self.count, 
+                    cmap=self.cmap
+                    )
+
+            if self.itot is not None:
+                plt.imsave(os.path.join(
+                    self.output_dir, "itot.png"),
+                    self.itot, 
+                    cmap=self.cmap
+                    )
+                
+            if self.verbose:
+                print(f"[INFO] Saved images to {self.output_dir}")
+            
         if verbose:
             print("[DONE]")
             
@@ -569,9 +599,12 @@ class timepix3:
                 print(f"      values_role   : {g('values_role')}  ")
 
         print(" * Files information : (filename) (data type)")
-        print(f"      indptr_file   : {g('indptr_file')}   dtype={g('indptr_dtype')}")
-        print(f"      indices_file  : {g('indices_file')}  dtype={g('indices_dtype')}")
-        print(f"      data_file     : {g('data_file')}   dtype={g('data_dtype')}")
+        print(
+            f"      indptr_file   : {g('indptr_file')}   dtype={g('indptr_dtype')}")
+        print(
+            f"      indices_file  : {g('indices_file')}  dtype={g('indices_dtype')}")
+        print(
+            f"      data_file     : {g('data_file')}   dtype={g('data_dtype')}")
 
         # Sizes and simple stats
         print(" * Size information:")
@@ -592,8 +625,8 @@ class timepix3:
                packets, descriptors, scan_dims=(1024, 768), num_patterns=10, 
                rows=2, cols=5, csquare=256, icut=5):
         """
-        Reconstructs and displays a random sample of diffraction patterns directly
-        from the raw packet data.
+        Reconstructs and displays a random sample of diffraction patterns 
+        directly from the raw packet data.
         
         Parameters
         ----------
@@ -608,7 +641,8 @@ class timepix3:
         rows, cols : int, optional
             The dimensions of the subplot grid.
         csquare : int, optional
-            Side length of a central square to crop from each pattern for display.
+            Side length of a central square to crop from each pattern for 
+            display.
             
         Returns
         -------
@@ -645,7 +679,7 @@ class timepix3:
                 img_height, img_width = img.shape
                 start_x = img_width // 2 - csquare // 2
                 start_y = img_height // 2 - csquare // 2
-                cimg = img[start_y:start_y + csquare, start_x:start_x + csquare]
+                cimg = img[start_y:start_y+csquare, start_x:start_x+csquare]
         
                 # Plot the cropped image on the i-th subplot
                 ax = axes[i]
@@ -673,7 +707,8 @@ class timepix3:
               packets, descriptors, pattern_index, scan_dims=(1024, 768), 
               detector_dims=(256, 256), dtype=np.uint32):
         """
-        Recovers the 2D diffraction pattern for a single pixel of the scan image.
+        Recovers the 2D diffraction pattern for a single pixel of the scan 
+        image.
     
         Parameters
         ----------
@@ -691,33 +726,15 @@ class timepix3:
         Returns
         -------
         numpy.ndarray
-            A 2D array (256x256) representing the diffraction pattern (hit counts).
+            A 2D array (256x256) representing the diffraction pattern.
             
-            
-        NOTE:  How It Works
-        - Scan Position: When you select a pixel [X,Y], in the (1024x768) scan grid, 
-             you are selecting the data acquired when the detector was physically 
-             at that position.
-        - Descriptor File: The .advb.desc file acts as an index. 
-             For scan pixel [X,Y], there is a corresponding entry in the descriptor 
-             file that tells you exactly where that detector data begins (offset) 
-             and how many packets it contains (packet_count) in the main .advb file.
-        - Data Packets: You then read that specific slice of packets. Each packet 
-             (address, count, itot) tells you that a detector pixel (identified by 
-             address) recorded a certain number of hits (count).
-        - Reconstruction: By creating a blank 256x256 array and populating it using 
-             the address and count from these packets, you reconstruct 
-             the 2D diffraction pattern recorded at that single scan position.
-    
-        This type of dataset is often called 4D STEM, where for each 2D scan 
-             position [X,Y], you record a 2D diffraction pattern (kx, ky).
         """
-        
-        #  Input Validation (Robustness Check) ------------------------------------
+        #  Input Validation (Robustness Check) 
         if not isinstance(scan_dims, (tuple, list)) or len(scan_dims) != 2:
             raise TypeError(
                 f"scan_dims must be a tuple of (width, height), but got {scan_dims}")
-        if not isinstance(detector_dims, (tuple, list)) or len(detector_dims) != 2:
+        if not isinstance(detector_dims, (tuple, list)) \
+            or len(detector_dims) != 2:
             raise TypeError(
                 f"detector_dims must be a tuple of (width, height), but got {detector_dims}")
         if not isinstance(pattern_index, int):
@@ -726,47 +743,205 @@ class timepix3:
         scan_width, scan_height = scan_dims
         det_width, det_height = detector_dims
         
-        # Calculate the linear index for the desired scan pixel -------------------
+        # Calculate the linear index for the desired scan pixel 
         if not (0 <= pattern_index < len(descriptors)):
             raise IndexError("Pattern index is out of bounds.")
         
-        # Get the specific descriptor for this frame ------------------------------
+        # Get the specific descriptor for this frame 
         descriptor = descriptors[pattern_index]
         frame_offset = descriptor["offset"]
         frame_packet_count = descriptor["packet_count"]
     
-        # Extract relevant packets ------------------------------------------------
+        # Extract relevant packets
         # frame_packets contains all the raw measurement data for that single 
         # diffraction pattern at position (scan_x, scan_y).
         frame_packets = packets[frame_offset:frame_offset + frame_packet_count]
     
-        # Create a blank canvas for the diffraction pattern -----------------------
+        # Create a blank canvas for the diffraction pattern 
         diffraction_image = np.zeros(detector_dims, dtype=dtype)
     
-        # Reconstruct the diffraction pattern -------------------------------------
+        # Reconstruct the diffraction pattern 
         # populate the canvas with diffractions using the address and count
         # the 'address' is a flattened 1D index for the 256x256 detector grid
         detector_addresses = frame_packets["address"]
         detector_counts = frame_packets["count"]
     
-        # Convert the 1D address to 2D (y, x) coordinates on the detector ---------
+        # Convert the 1D address to 2D (y, x) coordinates on the detector 
         det_y = detector_addresses // det_width
         det_x = detector_addresses % det_width
     
-        # Place the counts at the correct locations--------------------------------
+        # Place the counts at the correct locations
         np.add.at(diffraction_image, (det_y, det_x), detector_counts)
         
-        # Sum diffractogram -------------------------------------------------------
+        # Sum diffractogram
         count_sum = np.sum(np.sum(diffraction_image))
         
-        # Return diffractogram ----------------------------------------------------
+        # Return diffractogram 
         return diffraction_image, count_sum
 
 
+    def get_count_itot(self,
+                       packets, 
+                       descriptors, 
+                       scan_dims, 
+                       show=True, 
+                       cmap="gray"):
+        """
+        Constructs 2D images of total counts and iToT from raw data and 
+        descriptors.
+    
+        Parameters
+        ----------
+        packets : numpy.ndarray
+            The raw packet data from the .advb file.
+        descriptors : numpy.ndarray
+            The descriptor data from the .advb.desc file.
+        scan_dims : tuple (width, height) 
+            Scan size specifications (dimensions of the micrograph)
+        show : boolean
+            Display reconstructed images. Default is True.
+        cmap : string
+            Colormap of the displayed images, used when show=True.
+            Default is gray.
+    
+        Returns
+        --------
+        count_image : numpy.ndarray 
+            Image of total event counts per pixel.
+        itot_image : numpy.ndarray 
+            Image of total iToT per pixel.
+        """
+        # Initialize dimensions
+        width, height = scan_dims
+        
+        # Initialize arrays for inserting values from packets
+        count_image = np.zeros((height, width), dtype=np.uint32)
+        itot_image = np.zeros((height, width), dtype=np.uint32)
+    
+        # Initialize counters
+        current_offset = 0
+        frame_idx = 0
+        
+        # Iterate through descriptors and packets
+        for descriptor in descriptors:
+            # Find the starting point (offset in descriptors)
+            frame_start = current_offset
+            
+            # Find the teminating point (offset + packet counts)
+            frame_end = frame_start + descriptor["packet_count"]
+            
+            # Extract all packets for the one pixel
+            frame_packets = packets[frame_start:frame_end]
+            
+            # Find the next starting point
+            current_offset += descriptor["packet_count"]
+            
+            # Get the coordinates of the pixel position within the array
+            frame_pos_x = frame_idx % width
+            frame_pos_y = frame_idx // width
+    
+            if frame_pos_y < height:
+                # Hit count image
+                count_image[frame_pos_y, frame_pos_x] = \
+                    np.sum(frame_packets["count"])
+                
+                # iToT image
+                itot_image[frame_pos_y, frame_pos_x] = \
+                    np.sum(frame_packets["itot"])
+            
+            # Move to the next frame
+            frame_idx += 1
+        
+        # Optionally display reconstructed images 
+        if show:
+            if np.sum(count_image) != 0:
+                self.show_micrograph(
+                    count_image,
+                    title="Hit Counts Micrograph",
+                    cmap=cmap,
+                    save=False,
+                    filename=None,
+                    output_dir=self.out_dir,
+                    show=self.show
+                    )
+            else:
+                print("[INFO] Hit Counts not available.")
+                    
+            if np.sum(itot_image) != 0:
+                self.show_micrograph(
+                    itot_image,
+                    title="iToT Micrograph",
+                    cmap=cmap,
+                    save=False,
+                    filename=None,
+                    output_dir=self.out_dir,
+                    show=self.show
+                    )
+            else:
+                print("[INFO] iToTs not available.")
+                
+                
+        if np.sum(count_image) == 0:
+            return None, itot_image
+        
+        elif np.sum(itot_image) == 0:
+            return count_image, None
+        
+        else:
+            return count_image, itot_image
+    
+    
+    def show_micrograph(self, img, 
+                        title="Micrograph", 
+                        cmap="gray", 
+                        save=False, 
+                        filename=None, 
+                        output_dir=None,
+                        show=True):
+        """
+        Display and optionally save a micrograph.
+
+        Parameters
+        ----------
+        img : 2D array
+            Image to display.
+        title : str
+            Title for the plot.
+        cmap : str
+            Colormap to use.
+        save : bool
+            If True, save the image.
+        filename : str
+            Filename to save as (e.g. "filtered.png").
+        output_dir : str
+            Directory where to save the image.
+        show : bool
+            If True, display the image.
+        """
+        if show:
+            plt.figure(figsize=(6, 6))
+            plt.imshow(img, cmap=cmap, origin='lower')
+            plt.title(title)
+            plt.axis("off")
+            plt.tight_layout()
+            plt.show()
+
+        if save:
+            if filename is None:
+                raise ValueError(
+                    "If 'save' is True, you must provide a filename.")
+            if output_dir is None:
+                output_dir = os.getcwd()
+            os.makedirs(output_dir, exist_ok=True)
+            path = os.path.join(output_dir, filename)
+            plt.imsave(path, img, cmap=cmap)
+            print(f"[INFO] Saved: {path}")
+            
+            
     def ADVBLoader(self):
         # place holder 
         pass   
     
-class timepix1:
+class Timepix1:
     # place holder
     pass
