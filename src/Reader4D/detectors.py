@@ -153,7 +153,7 @@ class Timepix3:
 
         # Define output folder (change if needed) -----------------------------
         self.output_dir = os.path.join(
-            os.path.dirname(self.out_dir), "output_TPX3")
+            os.path.dirname(self.out_dir), "Reader4D_output")
         os.makedirs(self.output_dir, exist_ok=True)
         
         # Convert to a .h5 file for MATLAB optionally -------------------------
