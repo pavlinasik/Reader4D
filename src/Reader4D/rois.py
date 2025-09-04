@@ -7,6 +7,7 @@ Created on Mon Sep  1 15:11:17 2025
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.widgets import RectangleSelector
+from PIL import Image
 import matplotlib.patches as patches
 from tqdm import tqdm
 import os
@@ -81,12 +82,37 @@ class Extractor:
                 r4dConv.diff2hdf5(
                     packets=self.psubset, 
                     descriptors=self.dsubset,
-                    filename=self.out_dir+f"\\dim_{self.NEW_DIMS}_"+self.name_roi,
+                    filename=\
+                        self.out_dir+f"\\dim_{int(self.NEW_DIMS[0])}x{int(self.NEW_DIMS[1])}_"+self.name_roi,
                     verbose=self.verbose)
+            
+                base = os.path.splitext(self.name_roi)[0]
+                dims_tag = f"{int(self.NEW_DIMS[0])}x{int(self.NEW_DIMS[1])}"
+                png_path = os.path.join(
+                    self.out_dir, f"dim_{dims_tag}_{base}.png")
+                roi = np.asarray(self.roi)
+                
+                if roi.ndim == 2: # grayscale
+                    rmin = float(np.nanmin(roi))
+                    rmax = float(np.nanmax(roi))
+                    if rmax > rmin:
+                        roi8 = np.clip(
+                            (roi-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+                    else:
+                        roi8 = np.zeros_like(roi, dtype=np.uint8)
+                    Image.fromarray(roi8).save(png_path)
+                else:
+                    if roi.dtype != np.uint8:
+                       roi = np.clip(roi, 0, 255).astype(np.uint8)
+                    Image.fromarray(roi).save(png_path) 
+                
+                if self.verbose:
+                    print(f"[INFO] Saved ROI PNG to: {png_path}")
+
+
             else:
                 print("Argument name_roi is missing. Required for saving.")
                 sys.exit()
-        
         
         
     def get_ROI(self,
@@ -450,9 +476,6 @@ class Extractor:
             **Only if** `return_example_idx` is not None and the index is valid:
             detector image reconstructed for that pixel; otherwise `None`.
         """
-        
-        offset = self.d_offset
-        packets_count = self.d_packet_count
         address = self.p_address
         counts = self.p_count
         im_dims = self.NEW_DIMS
@@ -541,5 +564,168 @@ class Extractor:
         
             plt.show()
         
+        self.froi = froi
+        return 
+    
+    
+    def filter_centered_ROI(self,
+                    lower=0.01, upper=0.20,
+                    sigma=None,                  
+                    ema_alpha=None,
+                    n_workers=None,
+                    chunk_size=4096):
+        """
+        Per-pixel masked sum using a *per-frame centered annulus* without
+        reconstructing full 2-D patterns. Fast path: operate directly on sparse events.
+    
+        The weight for an event at radius r is:
+          - hard ring: 1 if r_in <= r <= r_out else 0
+          - soft ring: 0.5*(erf((r-r_in)/(sqrt(2)*sigma)) - erf((r-r_out)/(sqrt(2)*sigma)))
+    
+        Parameters
+        ----------
+        lower, upper : float
+            Inner/outer radii as fractions of (detector_width/2).
+        sigma : float or None
+            Soft edge width in *pixels*. None or 0 -> hard (binary) annulus.
+        ema_alpha : float or None
+            If set (e.g. 0.10–0.20), center-of-mass is smoothed frame-to-frame
+            via exponential moving average to reduce jitter in sparse frames.
+        n_workers : int or None
+            Thread count (default: min(32, os.cpu_count() or 4)).
+        chunk_size : int
+            Number of ROI pixels per worker task.
+    
+        Returns
+        -------
+        froi : (Hroi, Wroi) float64
+            Filtered (masked) sums.
+        rroi : (Hroi, Wroi) float64
+            Unfiltered sums.
+        """
+        from scipy.special import erf  # vectorized error function
+
+        # Pull inputs from the instance
+        address = self.p_address         # list-of-1D arrays per ROI pixel
+        counts  = self.p_count           # list-of-1D arrays per ROI pixel
+        Hroi, Wroi = self.NEW_DIMS
+        Hdet, Wdet = self.DET_DIMS
+        cmap = self.CMAP
+        show = self.show
+    
+        if self.verbose:
+            print("[INFO] Filtering ROI with per-frame centered annulus...")
+    
+        # Basic sanity
+        N = len(address)
+        assert Hroi * Wroi == N, f"ROI dims {Hroi,Wroi} != number of pixels {N}"
+    
+        # Radii in pixels (use detector width as in your original mask helper)
+        r_in  = 0.5 * Wdet * float(lower)
+        r_out = 0.5 * Wdet * float(upper)
+        soft  = (sigma is not None) and (float(sigma) > 0)
+        if soft:
+            sigma = float(sigma)
+            inv_s = 1.0 / (np.sqrt(2.0) * sigma)
+    
+        # Output buffers (1-D; reshape at the end)
+        raw_sums  = np.zeros(N, dtype=np.float64)
+        filt_sums = np.zeros(N, dtype=np.float64)
+    
+        # Optional EMA center (start from geometric center)
+        cx_run = (Wdet - 1) / 2.0
+        cy_run = (Hdet - 1) / 2.0
+        use_ema = (ema_alpha is not None) and (0.0 < float(ema_alpha) <= 1.0)
+        if use_ema:
+            ema_alpha = float(ema_alpha)
+    
+        det_size = Hdet * Wdet
+    
+        def _worker(start, end):
+            rs = np.zeros(end - start, dtype=np.float64)
+            fs = np.zeros(end - start, dtype=np.float64)
+    
+            # Use local copies of running center for each thread
+            cx_loc, cy_loc = cx_run, cy_run
+    
+            for j, idx in enumerate(range(start, end)):
+                a = np.asarray(address[idx], dtype=np.int64)
+                c = np.asarray(counts[idx],  dtype=np.float64)
+                if c.size == 0:
+                    continue
+    
+                # guard invalid addresses
+                valid = (a >= 0) & (a < det_size)
+                if not np.all(valid):
+                    a = a[valid]; c = c[valid]
+                    if c.size == 0:
+                        continue
+    
+                # event coords
+                y = a // Wdet
+                x = a %  Wdet
+    
+                # center-of-mass (counts-weighted)
+                tot = c.sum()
+                if tot > 0:
+                    cx = (x * c).sum() / tot
+                    cy = (y * c).sum() / tot
+                    if use_ema:
+                        cx_loc = (1.0 - ema_alpha) * cx_loc + ema_alpha * cx
+                        cy_loc = (1.0 - ema_alpha) * cy_loc + ema_alpha * cy
+                    else:
+                        cx_loc, cy_loc = cx, cy
+    
+                # radial distances from (cx_loc, cy_loc)
+                dx = x - cx_loc
+                dy = y - cy_loc
+                r  = np.sqrt(dx*dx + dy*dy)
+    
+                if soft:
+                    # smooth ring via error function (fast, no 2-D mask needed)
+                    # weight ~ 1 in [r_in, r_out], smooth edges of width ~sigma
+                    w = 0.5 * (erf((r - r_in) * inv_s) - erf((r - r_out) * inv_s))
+                else:
+                    # hard binary annulus
+                    w = ((r >= r_in) & (r <= r_out)).astype(np.float64)
+    
+                rs[j] = tot
+                fs[j] = np.dot(c, w)
+    
+            return start, end, rs, fs
+    
+        # Thread pool over chunks
+        if n_workers is None:
+            n_workers = min(32, (os.cpu_count() or 4))
+        ranges = [(s, min(s + chunk_size, N)) for s in range(0, N, chunk_size)]
+    
+        with ThreadPoolExecutor(max_workers=n_workers) as ex, tqdm(
+                total=N, desc="Reconstructing ROI", unit="px", dynamic_ncols=True) as pbar:
+            futures = [ex.submit(_worker, s, e) for (s, e) in ranges]
+            for fut in as_completed(futures):
+                s, e, rs, fs = fut.result()
+                raw_sums[s:e]  = rs
+                filt_sums[s:e] = fs
+                pbar.update(e - s)
+    
+        # Images
+        rroi = raw_sums.reshape(Hroi, Wroi)
+        froi = filt_sums.reshape(Hroi, Wroi)
+    
+        if show:
+            import matplotlib.pyplot as plt
+            # No filtration
+            fig, ax = plt.subplots(constrained_layout=True)
+            im = ax.imshow(rroi, cmap=cmap, origin="lower")
+            ax.set_title("ROI (no filtration)"); ax.axis("off")
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cb.set_label("intensity", rotation=90)
+    
+            # Filtration
+            fig, ax = plt.subplots(constrained_layout=True)
+            im = ax.imshow(froi, cmap=cmap, origin="lower")
+            ax.set_title("ROI (filtration, centered annulus)"); ax.axis("off")
+            cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cb.set_label("intensity", rotation=90)
+            plt.show()
+    
         self.froi = froi
         return 
