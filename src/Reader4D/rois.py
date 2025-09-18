@@ -10,10 +10,12 @@ from matplotlib.widgets import RectangleSelector
 from PIL import Image
 import matplotlib.patches as patches
 from tqdm import tqdm
-import os
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import os, datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import Reader4D.convertor as r4dConv
 import sys
+from scipy.special import erf
+
 
 
 class Extractor:
@@ -21,6 +23,7 @@ class Extractor:
             micrograph,
             descriptors,
             packets,
+            values_role,
             out_dir,
             header=None,
             scan_dims=(1024,768), 
@@ -35,6 +38,7 @@ class Extractor:
         
         self.micrograph = micrograph
         self.descriptors = descriptors
+        self.values_role = values_role
         self.out_dir = out_dir
         self.packets = packets
         self.header = header
@@ -113,6 +117,9 @@ class Extractor:
             else:
                 print("Argument name_roi is missing. Required for saving.")
                 sys.exit()
+        
+        if verbose:
+            print("[DONE : Region of interest extraction]")
         
         
     def get_ROI(self,
@@ -351,7 +358,7 @@ class Extractor:
             # PACKETS indexing
             p = packets[do:do+dpc]
             pa = p["address"]
-            pc = p["count"]
+            pc = p[self.values_role]
             p_address.append(pa)
             p_count.append(pc)
             
@@ -408,8 +415,8 @@ class Extractor:
     def filter_ROI(self, 
                     mask,
                     n_workers=None,                 # e.g. os.cpu_count()
-                    chunk_size=4096                 # pixels per worker chunk
-                    ):
+                    chunk_size=4096,                # pixels per worker chunk
+                    save_im=True):
         """
         Compute a per-pixel, detector-masked sum for a Region of Interest (ROI)
         **without** reconstructing full 2-D diffraction patterns, and do it in
@@ -565,15 +572,237 @@ class Extractor:
             plt.show()
         
         self.froi = froi
+        
+        if save_im:
+            base = os.path.splitext(self.name_roi)[0]
+            dims_tag = f"{int(self.NEW_DIMS[0])}x{int(self.NEW_DIMS[1])}"
+            png_path = os.path.join(
+                self.out_dir, f"filt_{dims_tag}_{base}.png")
+            roi = np.asarray(self.froi)
+            
+            if roi.ndim == 2: # grayscale
+                rmin = float(np.nanmin(roi))
+                rmax = float(np.nanmax(roi))
+                if rmax > rmin:
+                    roi8 = np.clip(
+                        (roi-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+                else:
+                    roi8 = np.zeros_like(roi, dtype=np.uint8)
+                Image.fromarray(roi8).save(png_path)
+            else:
+                if roi.dtype != np.uint8:
+                   roi = np.clip(roi, 0, 255).astype(np.uint8)
+                Image.fromarray(roi).save(png_path) 
+                
         return 
     
     
     def filter_centered_ROI(self,
+                        lower=0.01, upper=0.20,
+                        sigma=None,
+                        ema_alpha=None,
+                        n_workers=None,
+                        chunk_size=4096,
+                        save_im=True,
+                        *,
+                        normalize=True,         # <-- NEW: per-frame dose normalization
+                        complement=False,       # <-- NEW: use outside-of-mask (tot - masked)
+                        invert_display=False,   # <-- NEW: flip intensities for visualization
+                        trim_pct=0.0            # <-- NEW: robust COM; e.g. 0.5 trims top 0.5% counts
+                        ):
+        """
+        Per-frame centered annulus/disk. Works directly on sparse events.
+    
+        NEW OPTIONS
+        -----------
+        normalize      : If True, use masked_fraction = masked_sum / total_sum.
+                         This usually makes BF/DF/HAADF resemble conventional STEM.
+        complement     : If True, use 'outside' of the mask: masked_sum = total_sum - inside_sum.
+                         Useful if your mask is defined as an exclusion zone.
+        invert_display : Visually invert the final image (no effect on saved raw values).
+        trim_pct       : Robustify center-of-mass (COM) by trimming brightest events when computing COM.
+                         Example: 0.5 keeps everything <= 99.5th percentile for COM calc.
+        """
+    
+        address = self.p_address
+        counts  = self.p_count
+        Hroi, Wroi = self.NEW_DIMS
+        Hdet, Wdet = self.DET_DIMS
+        cmap = self.CMAP
+        show = self.show
+    
+        if self.verbose:
+            print("[INFO] Filtering ROI with per-frame centered annulus...")
+    
+        N = len(address)
+        assert Hroi * Wroi == N, f"ROI dims {Hroi,Wroi} != number of pixels {N}"
+    
+        # Radii in pixels (based on detector width like your original helper)
+        r_in  = 0.5 * Wdet * float(lower)
+        r_out = 0.5 * Wdet * float(upper)
+        soft  = (sigma is not None) and (float(sigma) > 0)
+        if soft:
+            sigma = float(sigma)
+            inv_s = 1.0 / (np.sqrt(2.0) * sigma)
+        
+        # unmasked total
+        raw_sums  = np.zeros(N, dtype=np.float64) 
+        
+        # masked (or outside) sum (possibly normalized)
+        filt_sums = np.zeros(N, dtype=np.float64) 
+    
+        # Optional EMA center starting at geometric center
+        cx_run = (Wdet - 1) / 2.0
+        cy_run = (Hdet - 1) / 2.0
+        use_ema = (ema_alpha is not None) and (0.0 < float(ema_alpha) <= 1.0)
+        if use_ema:
+            ema_alpha = float(ema_alpha)
+    
+        det_size = Hdet * Wdet
+        eps = 1e-12  # to avoid division by zero
+    
+        def _worker(start, end):
+            rs = np.zeros(end - start, dtype=np.float64)
+            fs = np.zeros(end - start, dtype=np.float64)
+            cx_loc, cy_loc = cx_run, cy_run  # local copies per-thread
+    
+            for j, idx in enumerate(range(start, end)):
+                a = np.asarray(address[idx], dtype=np.int64)
+                c = np.asarray(counts[idx],  dtype=np.float64)
+                if c.size == 0:
+                    continue
+    
+                # keep valid detector addresses
+                valid = (a >= 0) & (a < det_size)
+                if not np.all(valid):
+                    a = a[valid]; c = c[valid]
+                    if c.size == 0:
+                        continue
+    
+                y = a // Wdet
+                x = a %  Wdet
+    
+                # robust center-of-mass (optional trimming)
+                c_for_com = c
+                if trim_pct and trim_pct > 0:
+                    # cap very bright outliers for COM computation
+                    hi = np.percentile(c, 100.0 * (1.0 - float(trim_pct)))
+                    # use clipped weights only for center location 
+                    # (not for intensity)
+                    c_for_com = np.minimum(c, hi)
+    
+                tot = c.sum()
+                tot_com = c_for_com.sum()
+                if tot_com > 0:
+                    cx = (x * c_for_com).sum() / tot_com
+                    cy = (y * c_for_com).sum() / tot_com
+                    if use_ema:
+                        cx_loc = (1.0 - ema_alpha) * cx_loc + ema_alpha * cx
+                        cy_loc = (1.0 - ema_alpha) * cy_loc + ema_alpha * cy
+                    else:
+                        cx_loc, cy_loc = cx, cy
+    
+                # radial distances
+                dx = x - cx_loc
+                dy = y - cy_loc
+                r  = np.sqrt(dx*dx + dy*dy)
+    
+                if soft:
+                    w_inside = 0.5*(erf((r-r_in)*inv_s)-erf((r-r_out)*inv_s))
+                else:
+                    w_inside = ((r >= r_in) & (r <= r_out)).astype(np.float64)
+    
+                inside_sum = np.dot(c, w_inside)
+                masked_sum = inside_sum
+                if complement:
+                    # outside of the ring/disk
+                    masked_sum = tot - inside_sum   
+    
+                # dose-normalization per frame
+                if normalize:
+                    masked_sum = masked_sum / max(tot, eps)
+    
+                rs[j] = tot
+                fs[j] = masked_sum
+    
+            return start, end, rs, fs
+    
+        # Thread pool over chunks
+        if n_workers is None:
+            n_workers = min(32, (os.cpu_count() or 4))
+        ranges = [(s, min(s + chunk_size, N)) for s in range(0, N, chunk_size)]
+    
+        with ThreadPoolExecutor(max_workers=n_workers) as ex, tqdm(
+            total=N, desc="Reconstructing ROI", unit="px", dynamic_ncols=True
+        ) as pbar:
+            futures = [ex.submit(_worker, s, e) for (s, e) in ranges]
+            for fut in as_completed(futures):
+                s, e, rs, fs = fut.result()
+                raw_sums[s:e]  = rs
+                filt_sums[s:e] = fs
+                pbar.update(e - s)
+    
+        rroi = raw_sums.reshape(Hroi, Wroi)
+        froi = filt_sums.reshape(Hroi, Wroi)
+    
+        # optional visual inversion for display only
+        froi_vis = (np.max(froi) - froi) if invert_display else froi
+    
+        if show:
+            fig, ax = plt.subplots(constrained_layout=True)
+            im = ax.imshow(rroi, cmap=cmap, origin="lower")
+            ax.set_title("ROI (no filtration)"); ax.axis("off")
+            cb = fig.colorbar(im, 
+                              ax=ax, 
+                              fraction=0.046, 
+                              pad=0.04) 
+            cb.set_label("intensity", rotation=90)
+    
+            fig, ax = plt.subplots(constrained_layout=True)
+            im = ax.imshow(froi_vis, cmap=cmap, origin="lower")
+            ax.set_title("ROI (filtration, centered annulus)"); ax.axis("off")
+            cb = fig.colorbar(im,
+                              ax=ax, 
+                              fraction=0.046, 
+                              pad=0.04)
+            cb.set_label("intensity", rotation=90)
+            plt.show()
+    
+        self.froi = froi  # keep the raw (non-inverted) values
+    
+        if save_im:
+            # suffix for filename
+            if lower == 0.0:
+                suffix = "BF"
+            elif upper <= 0.5:
+                suffix = "DF"
+            else:
+                suffix = "HADF"
+            base = os.path.splitext(self.name_roi)[0]
+            dims_tag = f"{int(self.NEW_DIMS[0])}x{int(self.NEW_DIMS[1])}"
+            png_path = os.path.join(
+                self.out_dir, f"filtC_{dims_tag}_{base}_{suffix}.png")
+    
+            # Save an 8-bit preview of froi_vis
+            img = froi_vis
+            rmin, rmax = float(np.nanmin(img)), float(np.nanmax(img))
+            if rmax > rmin:
+                img8 = np.clip((img-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+            else:
+                img8 = np.zeros_like(img, dtype=np.uint8)
+            Image.fromarray(img8).save(png_path)
+    
+        return
+
+
+
+    def _filter_centered_ROI(self,
                     lower=0.01, upper=0.20,
                     sigma=None,                  
                     ema_alpha=None,
                     n_workers=None,
-                    chunk_size=4096):
+                    chunk_size=4096,
+                    save_im=True):
         """
         Per-pixel masked sum using a *per-frame centered annulus* without
         reconstructing full 2-D patterns. Fast path: operate directly on sparse events.
@@ -725,7 +954,243 @@ class Extractor:
             im = ax.imshow(froi, cmap=cmap, origin="lower")
             ax.set_title("ROI (filtration, centered annulus)"); ax.axis("off")
             cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04); cb.set_label("intensity", rotation=90)
-            plt.show()
+            plt.show()           
     
         self.froi = froi
+        
+        if save_im:
+            if lower==0.00:
+                suffix = "BF"
+            elif (lower>0 and upper < 0.5):
+                suffix = "DF"
+            elif (lower>0 and upper > 0.5):
+                suffix = "HADF"
+            else: suffix = "XX"
+            
+            base = os.path.splitext(self.name_roi)[0]
+            dims_tag = f"{int(self.NEW_DIMS[0])}x{int(self.NEW_DIMS[1])}"
+            png_path = os.path.join(
+                self.out_dir, f"filtC_{dims_tag}_{base}_{suffix}.png")
+            roi = np.asarray(self.froi)
+            
+            if roi.ndim == 2: # grayscale
+                rmin = float(np.nanmin(roi))
+                rmax = float(np.nanmax(roi))
+                if rmax > rmin:
+                    roi8 = np.clip(
+                        (roi-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+                else:
+                    roi8 = np.zeros_like(roi, dtype=np.uint8)
+                Image.fromarray(roi8).save(png_path)
+            else:
+                if roi.dtype != np.uint8:
+                   roi = np.clip(roi, 0, 255).astype(np.uint8)
+                Image.fromarray(roi).save(png_path) 
+            
+            
         return 
+    
+    
+    def pick_and_show_diffraction(self,
+                              serpentine=False,
+                              cmap_diff="viridis",
+                              title_prefix="Frame",
+                              max_points=None,
+                              save_all=True):
+        """
+        Show micrograph, let the user click multiple pixels (finish with Enter),
+        then show the selected points overlaid on the micrograph AND a grid of
+        their diffractograms.
+    
+        Returns
+        -------
+        idx_list : list[int]
+            Linear frame indices (row-major, accounting for serpentine if
+                                  enabled).
+        xy_list  : list[tuple[int,int]]
+            Pixel coordinates (x, y) in display coordinates (0..W-1, 0..H-1).
+        frames   : list[np.ndarray]
+            Each is (Hdet, Wdet) reconstructed diffractogram.
+        """
+        packets       = self.psubset
+        descriptors   = self.dsubset
+        scan_dims     = self.NEW_DIMS    # (H, W)
+        det_dims      = self.DET_DIMS    # (Wdet, Hdet)
+        values_role   = self.values_role
+        cmap_img      = self.CMAP
+    
+        H, W = map(int, scan_dims)
+        Wdet, Hdet = map(int, det_dims)
+    
+        # packet counts & offsets
+        pc = np.asarray(descriptors["packet_count"],dtype=np.int64).reshape(-1)
+        n_frames = pc.size
+        
+        s = np.copy(scan_dims)
+        if n_frames != W * H:
+            n = np.copy(n_frames)
+            raise ValueError(
+                f"scan_dims {s} imply {W*H} frames, got {n} descriptors.")
+    
+        off = np.empty_like(pc, dtype=np.int64)
+        if pc.size:
+            off[0] = 0
+            if pc.size > 1:
+                np.cumsum(pc[:-1], out=off[1:])
+    
+        if off[-1] + pc[-1] > packets.shape[0]:
+            raise ValueError(
+                "Descriptors reference more packets than available.")
+    
+        # micrograph (fast)
+        vals = np.asarray(packets[values_role], dtype=np.float64)
+        micro_sums = np.add.reduceat(vals, off)        # sum per frame
+        micro = micro_sums.reshape(H, W)               # row-major (y, x)
+    
+        # visualization image (optionally serpentine-flipped for display)
+        if serpentine:
+            micro_vis = micro.copy()
+            micro_vis[1::2, :] = micro_vis[1::2, ::-1]
+        else:
+            micro_vis = micro
+    
+        # interactive picking (multiple points; finish with Enter)
+        fig, ax = plt.subplots(figsize=(12, 10))
+        im = ax.imshow(micro_vis, origin="lower", cmap=cmap_img)
+        ax.set_title("Click multiple pixels; press Enter to finish")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        plt.tight_layout()
+    
+        picked_xy = []          # (x,y) display coordinates
+        annots = []
+    
+        def on_click(event):
+            if event.inaxes is not ax:
+                return
+            if event.button is None:  
+                # keyboard event passes here sometimes
+                return
+            
+            # convert to nearest integer pixel
+            x = int(np.clip(round(event.xdata), 0, W - 1))
+            y = int(np.clip(round(event.ydata), 0, H - 1))
+            picked_xy.append((x, y))
+            
+            # draw a marker+index
+            idx_lbl = len(picked_xy)
+            m = ax.plot(
+                x, y, marker='o', ms=6, mfc='none', mec='r', mew=1.5)[0]
+            t = ax.text(x + 2, y + 2, str(idx_lbl), color='yellow', fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.15", 
+                                  fc="black", 
+                                  alpha=0.4))
+            annots.append((m, t))
+            fig.canvas.draw_idle()
+            
+            # respect optional max_points
+            if (max_points is not None) and (len(picked_xy) >= max_points):
+                plt.close(fig)
+    
+        def on_key(event):
+            if event.key in ("enter", "return"):
+                plt.close(fig)
+    
+        cid1 = fig.canvas.mpl_connect('button_press_event', on_click)
+        cid2 = fig.canvas.mpl_connect('key_press_event', on_key)
+        plt.show(block=True)   # wait until closed by Enter or max_points
+    
+        # disconnect
+        try:
+            fig.canvas.mpl_disconnect(cid1)
+            fig.canvas.mpl_disconnect(cid2)
+        except Exception:
+            pass
+    
+        if not picked_xy:
+            raise RuntimeError("No points selected.")
+    
+        # Map picked (x,y) to linear indices, accounting for serpentine
+        idx_list = []
+        xy_list  = []
+        for (x, y) in picked_xy:
+            if serpentine and (y % 2 == 1):   
+                # even rows (0-based) scanned R->L
+                x_scan = W - 1 - x
+            else:
+                x_scan = x
+            idx = y * W + x_scan
+            idx_list.append(int(idx))
+            xy_list.append((int(x), int(y)))
+    
+        # Reconstruct diffractograms for each picked idx
+        frames = []
+        for i, idx in enumerate(idx_list):
+            s = int(off[idx]); e = s + int(pc[idx])
+            frame_pkts = packets[s:e]
+            img = np.zeros((Hdet, Wdet), dtype=np.float64)
+            if e > s:
+                addr = frame_pkts["address"].astype(np.int64, copy=False)
+                w    = frame_pkts[values_role].astype(np.float64, copy=False)
+                det_size = Wdet * Hdet
+                valid = (addr >= 0) & (addr < det_size)
+                if not np.all(valid):
+                    addr = addr[valid]; w = w[valid]
+                np.add.at(img.ravel(), addr, w)
+            frames.append(img)
+    
+        # Show: 1) micrograph with picked points (already drawn), 
+        #       2) grid of diffractograms
+        # re-show micrograph with markers (static)
+        fig_m, ax_m = plt.subplots(figsize=(12, 10))
+        im_m = ax_m.imshow(micro_vis, origin="lower", cmap=cmap_img)
+        ax_m.set_title(f"Selected points (n={len(xy_list)})")
+        plt.colorbar(im_m, ax=ax_m, fraction=0.046, pad=0.04)
+        for k, (x, y) in enumerate(picked_xy, start=1):
+            ax_m.plot(x, y, 'o', ms=6, mfc='none', mec='r', mew=1.5)
+            ax_m.text(x + 2, y + 2, str(k), color='yellow', fontsize=9,
+                      bbox=dict(boxstyle="round,pad=0.15", 
+                                fc="black", 
+                                alpha=0.4))
+        plt.tight_layout()
+        plt.show(block=False)
+    
+        # grid for diffractograms
+        M = len(frames)
+        ncols = min(4, M)
+        nrows = int(np.ceil(M / ncols))
+        fig_d, axes = plt.subplots(nrows, ncols, 
+                                   figsize=(3.5*ncols, 3.2*nrows),
+                                   squeeze=False)
+        for k, ax in enumerate(axes.ravel()):
+            if k < M:
+                img = frames[k]
+                (x, y) = xy_list[k]
+                idx = idx_list[k]
+                h = ax.imshow(img, origin="lower", cmap=cmap_diff)
+                ax.set_title(
+                    f"{title_prefix} #{k+1}\n(x={x}, y={y}, idx={idx})", 
+                    fontsize=9)
+                ax.set_xticks([]); ax.set_yticks([])
+                plt.colorbar(h, ax=ax, fraction=0.046, pad=0.04)
+            else:
+                ax.axis('off')
+        plt.tight_layout()
+        plt.show(block=False)
+        
+        if save_all:
+            # decide output folder
+            out_dir = getattr(self, "out_dir", None) or os.getcwd()
+            os.makedirs(out_dir, exist_ok=True)
+    
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            micro_name = f"_micro_{H}x{W}_{ts}.png"
+            diffs_name = f"_diffs_{M}_{Wdet}x{Hdet}_{ts}.png"
+            micro_path = os.path.join(out_dir, micro_name)
+            diffs_path = os.path.join(out_dir, diffs_name)
+    
+            # save figures
+            fig_m.savefig(micro_path, dpi=200, bbox_inches="tight")
+            fig_d.savefig(diffs_path, dpi=200, bbox_inches="tight")
+    
+        return idx_list, xy_list, frames
+        

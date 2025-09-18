@@ -19,6 +19,7 @@ class Annular:
                 pattern,
                 packets,
                 descriptors,
+                values_role,
                 out_dir,
                 header = None,
                 scan_dims = (1024, 768),
@@ -42,7 +43,8 @@ class Annular:
         ## Initialize input attributes ---------------------------------------
         self.pattern = pattern
         self.packets = packets
-        self.descriptors = descriptors,
+        self.descriptors = descriptors
+        self.values_role = values_role
         self.out_dir = out_dir
         self.header = header
         self.DET_DIMS = pattern.shape
@@ -97,7 +99,7 @@ class Annular:
                 if self.verbose:
                     print("[INFO] Showing mask effect on a sample pattern...")
                     
-                self.show_filtration(self.pattern, self.mask, self.CMAP)
+                self.show_filtration(self.pattern, self.mask, "viridis")
     
             # Generate filtered micrograph
             if self.verbose:
@@ -137,7 +139,8 @@ class Annular:
                 print(f"[INFO] Saved filtered micrograph to {self.out_dir}")
             
 
-
+        if verbose:
+            print("[DONE : Application of virtual detectors]")
     
     def create_mask(self, dim_x=256, dim_y=256, lower=0.01, upper=0.20,
                     coord_x=None, coord_y=None, show=True, blur_sigma=None):
@@ -449,12 +452,12 @@ class Annular:
         each diffraction pattern and summing masked counts per scan pixel.
         """
     
-        # ---- dims (note: NumPy arrays are (rows, cols) = (H, W)) ----
+        # dims (note: NumPy arrays are (rows, cols) = (H, W))
         width, height = scan_dims                   # (W, H) as in your API
         det_w, det_h = detector_dims                # (Wdet, Hdet)
         det_size = det_w * det_h
     
-        # ---- ensure plain ndarrays (not h5py datasets) ----
+        # ensure plain ndarrays (not h5py datasets)
         # ensure plain ndarrays (not h5py datasets)
         desc = np.asarray(descriptors)
         
@@ -475,23 +478,23 @@ class Annular:
         
         N = off.shape[0]
     
-        # ---- mask prep (vectorized) ----
+        # mask prep (vectorized) 
         mask = np.asarray(mask)
         assert mask.shape == \
             (det_h, det_w), f"mask shape {mask.shape} != {(det_h, det_w)}"
         mask_flat = mask.ravel()
     
-        # ---- output image ----
+        # output image 
         fimg = np.zeros((height, width), dtype=np.uint32)
     
-        # ---- main loop (index by k; pull scalar off/pc) ----
+        # main loop (index by k; pull scalar off/pc) 
         for k in tqdm(range(N), desc="Reconstructing Image"):
             s = int(off[k])
             e = s + int(pc[k])
             frame = packets[s:e]
             if frame.size:
                 addr = frame["address"].astype(np.int64, copy=False)
-                cnt  = frame["count"].astype(np.float64, copy=False)
+                cnt  = frame[self.values_role].astype(np.float64, copy=False)
     
                 # guard addresses
                 valid = (addr >= 0) & (addr < det_size)
@@ -556,7 +559,8 @@ class Annular:
             pattern = np.zeros((det_h, det_w), dtype=np.float32)
             if packets_subset.size > 0:
                 addr = packets_subset["address"].astype(np.int64, copy=False)
-                cnt  = packets_subset["count"].astype(np.float32, copy=False)
+                cnt  = packets_subset[self.values_role].astype(np.float32, 
+                                                               copy=False)
                 # guard bad addresses
                 det_size = det_h * det_w
                 valid = (addr >= 0) & (addr < det_size)

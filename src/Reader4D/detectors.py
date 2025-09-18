@@ -84,6 +84,7 @@ class Timepix3:
                 indptr        = "indptr.raw",
                 indices       = "indices.raw",
                 data          = "values.raw",
+                values_role   = "count",
                 data_type     = "csr",
                 scan_dims     = None,
                 det_dims      = None,
@@ -113,6 +114,7 @@ class Timepix3:
         self.triplet1 = indptr
         self.triplet2 = indices
         self.triplet3 = data
+        self.values_role = values_role
         self.data_type = data_type
         self.SCAN_DIMS = scan_dims
         self.DET_DIMS = det_dims
@@ -133,6 +135,7 @@ class Timepix3:
                                             indptr=self.triplet1,
                                             indices=self.triplet2,
                                             data=self.triplet3,
+                                            values_role=self.values_role,
                                             progress=self.progress,
                                             return_header=self.return_header
                                             )
@@ -152,10 +155,20 @@ class Timepix3:
             self.DET_DIMS = self.header['sig_shape']
 
         # Define output folder (change if needed) -----------------------------
-        self.output_dir = os.path.join(
-            os.path.dirname(self.out_dir), "Reader4D_output")
-        os.makedirs(self.output_dir, exist_ok=True)
+        # Base inside the input data folder
+        base_output = os.path.join(self.out_dir, "Reader4D_output")
+        os.makedirs(base_output, exist_ok=True)
         
+        # Choose subfolder based on values_role
+        if self.values_role == "count":
+            self.output_dir = os.path.join(base_output, "count")
+        elif self.values_role == "itot":
+            self.output_dir = os.path.join(base_output, "itot")
+        else:
+            self.output_dir = base_output  # fallback if needed
+        
+        os.makedirs(self.output_dir, exist_ok=True)
+
         # Convert to a .h5 file for MATLAB optionally -------------------------
         if self.h5file is not None:
             r4dConv.diff2hdf5(
@@ -204,8 +217,13 @@ class Timepix3:
             if self.verbose:
                 print(f"[INFO] Saved images to {self.output_dir}")
             
+            if self.values_role == "count":
+                self.image = self.count
+            elif self.values_role == "itot":
+                self.image = self.itot
+            
         if verbose:
-            print("[DONE]")
+            print("[DONE : Loading data]")
             
             
     def CSRLoader(self,
@@ -249,6 +267,7 @@ class Timepix3:
             If "itot", values go to packets['itot'] and packets['count'] is
             zeroed. 
             Default is "count".
+            
         progress : bool, optional
             If True, prefetch each memmap with a tqdm progress bar. 
             Default True.
@@ -704,6 +723,104 @@ class Timepix3:
 
 
     def get_diffractogram(self, 
+                      packets, descriptors, pattern_index,
+                      scan_dims=(1024, 768),
+                      detector_dims=(256, 256),
+                      dtype=np.uint32):
+        """
+        Recovers the 2D diffraction pattern for a single pixel of the scan 
+        image.
+    
+        Parameters
+        ----------
+        packets : numpy.ndarray
+            The raw packet data from the .advb file.
+        descriptors : numpy.ndarray
+            The descriptor data from the .advb.desc file.
+        pattern_index : integer
+            Index of the diffractogram to be reconstructed.
+        scan_dims : tuple, optional
+            The (width, height) of the overall scan grid.
+        detector_dims : tuple, optional
+            The (width, height) of the detector.
+    
+        Returns
+        -------
+        numpy.ndarray
+            A 2D array (256x256) representing the diffraction pattern.
+            
+        """
+        # --- sanity on dims ---
+        if (not isinstance(scan_dims, (tuple, list))) or len(scan_dims) != 2:
+            raise TypeError(
+                f"scan_dims must be (width,height), got {scan_dims}")
+        if (not isinstance(detector_dims, (tuple, list))) or \
+            len(detector_dims) != 2:
+            raise TypeError(
+                f"detector_dims must be (width,height), got {detector_dims}")
+        if not isinstance(pattern_index, int):
+            raise TypeError("pattern_index must be an integer.")
+    
+        det_width, det_height = map(int, detector_dims)   # (Wdet, Hdet)
+        n_pkts = int(packets.shape[0])
+    
+        # normalize descriptors to 1D arrays pc (packet_count) and off (offset) 
+        desc = np.asarray(descriptors)
+        if "packet_count" not in getattr(desc.dtype, "names", ()):
+            raise TypeError("descriptors must have field 'packet_count'.")
+    
+        pc = np.asarray(desc["packet_count"], dtype=np.int64).reshape(-1)
+        n_frames = pc.size
+        if not (0 <= pattern_index < n_frames):
+            raise IndexError("pattern_index out of bounds.")
+    
+        # prefer provided offset if it matches packets length;otherwise rebuild
+        use_provided_off = ("offset" in desc.dtype.names)
+        if use_provided_off:
+            off = np.asarray(desc["offset"], dtype=np.int64).reshape(-1)
+            # check consistency only on the last frame to avoid O(N) sums
+            if off[-1] + pc[-1] != n_pkts:
+                use_provided_off = False
+    
+        if not use_provided_off:
+            off = np.empty_like(pc, dtype=np.int64)
+            if pc.size:
+                off[0] = 0
+                if pc.size > 1:
+                    np.cumsum(pc[:-1], out=off[1:])
+    
+        # slice this frame
+        s = int(off[pattern_index])
+        e = s + int(pc[pattern_index])
+        if s < 0 or e < s or e > n_pkts:
+            # out of range → treat as empty
+            return np.zeros((det_height, det_width), dtype=dtype), 0
+    
+        frame_pkts = packets[s:e]
+    
+        # reconstruct diffractogram
+        # NOTE: image shape must be (Hdet, Wdet) for (y,x) indexing
+        img = np.zeros((det_height, det_width), dtype=dtype)
+        if frame_pkts.size:
+            addr = frame_pkts["address"].astype(np.int64, copy=False)
+            vals = frame_pkts[
+                getattr(
+                    self, "values_role", "count")].astype(np.uint64, 
+                                                          copy=False)
+    
+            det_size = det_width * det_height
+            valid = (addr >= 0) & (addr < det_size)
+            if not np.all(valid):
+                addr = addr[valid]; vals = vals[valid]
+    
+            # accumulate into raveled image for speed, then done
+            np.add.at(img.ravel(), addr, vals)
+    
+        count_sum = int(img.sum())
+        return img, count_sum
+
+
+    def get_diffractogram_backup(self, 
               packets, descriptors, pattern_index, scan_dims=(1024, 768), 
               detector_dims=(256, 256), dtype=np.uint32):
         """
@@ -764,7 +881,7 @@ class Timepix3:
         # populate the canvas with diffractions using the address and count
         # the 'address' is a flattened 1D index for the 256x256 detector grid
         detector_addresses = frame_packets["address"]
-        detector_counts = frame_packets["count"]
+        detector_counts = frame_packets[self.values_role]
     
         # Convert the 1D address to 2D (y, x) coordinates on the detector 
         det_y = detector_addresses // det_width
