@@ -50,6 +50,10 @@ class Annular:
         self.descriptors = descriptors
         self.values_role = values_role
         self.out_dir = out_dir
+        
+        if not os.path.exists(self.out_dir):
+            os.makedirs(self.out_dir)
+    
         self.header = header
         self.DET_DIMS = pattern.shape
         
@@ -140,7 +144,7 @@ class Annular:
                 sigma=self.SIGMA)
         
         if self.save_im:
-            name = f"filtered_micrograph{mode}.png"
+            name = f"{self.name_im}.png"
             plt.imsave(os.path.join(
                 self.out_dir, name), 
                 fimg, 
@@ -416,7 +420,6 @@ class Annular:
             determination=method,
             refinement=None,
             rtype=1,
-            verbose=0, 
             final_print=False,
             )
         
