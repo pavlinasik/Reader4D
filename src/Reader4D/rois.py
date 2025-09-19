@@ -1156,7 +1156,7 @@ class Extractor:
     
         # grid for diffractograms
         M = len(frames)
-        ncols = min(4, M)
+        ncols = min(2, M)
         nrows = int(np.ceil(M / ncols))
         fig_d, axes = plt.subplots(nrows, ncols, 
                                    figsize=(3.5*ncols, 3.2*nrows),
