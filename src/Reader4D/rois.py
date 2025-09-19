@@ -236,79 +236,80 @@ class Extractor:
     
     def reconstruct_ROI(self, show=False):
         """
-        Reconstruct a Region of Interest (ROI) from binned descriptors/packets 
-        and return a quick “sum of counts” micrograph for that ROI, along with
-        the packet/descriptor subsets and per-pixel packet lists.
-
-        The function:
-          1) Converts the rectangular ROI (given in image coords) into linear 
-             indices using row-major order: idx = y * width + x.
-          2) For each ROI pixel, slices the corresponding packets via
-             descriptors[idx]['offset'] .. + packet_count and accumulates:
-             - per-pixel sum of 'count' values (for a quick 2-D ROI image),
-             - per-pixel lists of addresses and counts,
-             - detector coordinates (dx, dy) for each packet.
-          3) Builds `psubset` (a single contiguous structured array of all packets
-             belonging to the ROI) and `dsubset` (descriptors in ROI order).
-
+        Reconstruct a Region of Interest (ROI) from binned `descriptors` and
+        `packets` and build a quick “sum-of-counts” micrograph for that ROI. 
+        In addition, gather per-pixel packet subsets and detector coordinates 
+        for downstream use.
+    
+        Overview
+        --------
+        Given inclusive ROI bounds `self.coords` in image (scan) coordinates 
+        and full scan/detector dimensions:
+          - `self.SCAN_DIMS = (width, height)`
+          - `self.DET_DIMS  = (dwidth, dheight)`
+    
+        the function:
+          1) Generates linear scan indices in row-major order:
+             `idx = y * width + x` for all (x, y) in the ROI (inclusive bounds)
+          2) For each ROI pixel, slices packets via:
+             `start = descriptors[idx]['offset']`,
+             `count = descriptors[idx]['packet_count']`,
+             and accumulates:
+               • per-pixel sum of `packets[self.values_role]` 
+                 (for a 2-D ROI image),
+               • per-pixel lists of detector `address` and `values_role` 
+                 (“counts”),
+               • per-packet detector coordinates (dx, dy) decoded as:
+                 `dy = address // dwidth`, `dx = address % dwidth`.
+          3) Builds:
+               • `dsubset`: `descriptors[linear_indices]` (ROI order),
+               • `psubset`: a single contiguous slice/view of all ROI packets,
+                 constructed by concatenating respective ROI pixels.
+    
         Parameters
         ----------
-        descriptors : np.ndarray
-            Structured array of length H*W with fields:
-            - 'offset' (uint64 or uint32): starting index into `packets` 
-            - 'packet_count' (uint32): number of packets for this pixel.
-        packets : np.ndarray
-            Structured array of length N (all packets) with fields at least:
-            - 'address' (uint32): detector linear address (y * dwidth + x),
-            - 'count' (uint32): hit count for that address.
-            Additional fields (e.g., 'itot') are ignored here.
-        coords : tuple[float, float, float, float]
-            ROI bounds as (x_min, x_max, y_min, y_max) in image coordinates.
-            This implementation treats bounds as **inclusive** when building the
-            (rheight, rwidth) grid: rwidth = x_end - x_start + 1, etc.
-        scan_dims : tuple[int, int]
-            (width, height) of the **full** scan/image grid in pixels.
-            NOTE: order is (W, H).
-        det_dims : tuple[int, int]
-            (dwidth, dheight) of the detector grid. NOTE: order is (W, H) for
-            address decoding via dy = address // dwidth, dx = address % dwidth.
-        show : bool, default True
-            If True, display the quick reconstruction (sum of counts) for the ROI.
-
-        Returns
-        -------
-        roi : np.ndarray, shape (rheight, rwidth), dtype float64
-            Quick ROI image where each pixel is the sum of 'count' for the
-            corresponding scan position.
-        psubset : np.ndarray
-            Structured view/array of all packets that fall inside the ROI,
-            concatenated in ROI order (contiguous index array into `packets`).
-        dsubset : np.ndarray
-            Structured array of descriptors for ROI pixels (same fields as input
-            `descriptors`), in ROI order.
+        show : bool, optional (default: False)
+            If True, displays the quick reconstruction (sum of counts) for the 
+            ROI using `matplotlib` with `origin='lower'`.
+    
+        Side Effects (attributes set on `self`)
+        ---------------------------------------
+        roi : np.ndarray, shape (rheight, rwidth), float64
+            Sum-of-counts image over the ROI, where
+            rwidth  = x_end - x_start + 1,
+            rheight = y_end - y_start + 1.
+        psubset : np.ndarray (structured)
+            Concatenated view/array of all packets belonging to the ROI.
+        dsubset : np.ndarray (structured)
+            Descriptors for ROI pixels in ROI (scan) order.
         d_offset : list[int]
-            Per-ROI-pixel list of descriptor offsets (start indices into `packets`)
+            Per-ROI-pixel list of packet start offsets into `packets`.
         d_packet_count : list[int]
             Per-ROI-pixel list of packet counts.
         p_address : list[np.ndarray]
-            For each ROI pixel, a 1-D array of detector addresses of its packets.
+            For each ROI pixel, a 1-D array of detector linear addresses.
         p_count : list[np.ndarray]
-            For each ROI pixel, a 1-D array of packet counts aligned with p_address
+            For each ROI pixel, a 1-D array of packet values aligned with 
+            `p_address`, specifically `packets[self.values_role]`.
         dcoords : list[list[np.ndarray, np.ndarray]]
-            For each ROI pixel, a pair [dx, dy] where dx, dy are 1-D arrays of
+            For each ROI pixel, `[dx, dy]` where `dx`, `dy` are 1-D arrays of
             detector x/y coordinates decoded from `p_address`.
-
+    
         Notes
         -----
-        - The ROI bounds are handled inclusively (x_start..x_end, y_start..y_end),
-          which is why `+1` appears in the shape and slicing logic.
-        - Linear indices are computed with row-major layout using the full-image
-          width: idx = y * width + x.
-        - A debug `last_frame` is built internally but not returned.
-        - For very large ROIs, the per-pixel lists (`p_address`, `p_count`) can be
-          memory-heavy. If you only need the ROI image and `psubset`, consider
-          dropping those lists.
-
+        • ROI bounds in `self.coords` are treated as **inclusive** on both axes
+        • Linear indices are computed with row-major layout using the full scan
+          width: `idx = y * width + x` (no serpentine/“boustrophedon” handling)
+        • The detector width (`dwidth`) is used for address decoding:
+          `dy = address // dwidth`, `dx = address % dwidth`.
+        • This function assumes `len(descriptors) == width * height` and that
+          each descriptor’s (`offset`, `packet_count`) pair correctly indexes
+          into `packets`.
+    
+        Returns
+        -------
+        None
+            Results are stored on `self` (see “Side Effects” above).
         """
         if self.verbose:
             print("[INFO] Extracting relevant packets and descriptors...")
@@ -339,7 +340,8 @@ class Extractor:
         y_coords, x_coords = np.mgrid[y_start:y_end+1, x_start:x_end+1]
 
         # Create a single array of linear indices
-        linear_indices = (y_coords.ravel() * width + x_coords.ravel()).astype(int)
+        linear_indices = \
+            (y_coords.ravel() * width + x_coords.ravel()).astype(int)
 
         # Extract data using the linear indices
         d_offset, d_packet_count = [],[]
@@ -418,71 +420,60 @@ class Extractor:
                     chunk_size=4096,                # pixels per worker chunk
                     save_im=True):
         """
-        Compute a per-pixel, detector-masked sum for a Region of Interest (ROI)
-        **without** reconstructing full 2-D diffraction patterns, and do it in
-        parallel over pixel chunks.
-
-        This implementation treats each ROI pixel as a sparse list of detector
-        events: `address[i]` holds the linear detector indices for pixel *i* 
-        and `counts[i]` holds corresponding weights (e.g., hit counts). For a 
-        fixed detector-space mask `mask` (2-D), it computes:
-
-            raw_sum[i]  = sum(counts[i])
-            filt_sum[i] = sum(counts[i] * mask_flat[address[i]])
-
-        avoiding a 256×256 allocation per pixel. Work is split across threads 
-        in chunks to reduce Python overhead.
-
-        Parameters
-        ----------
-        offset : array-like, unused
-            Present for API compatibility with a “flat arrays” style; ignored 
-            here (this function expects list-per-pixel inputs in `address`/
-                  `counts`).
-        packets_count : array-like, unused
-            Present for API compatibility; ignored in this list-per-pixel 
-            variant.
-        address : list of 1D array-like, length Hroi*Wroi
-            For each ROI pixel (row-major order), the 1-D array of detector 
-            linear
-            addresses (0..Hdet*Wdet-1).
-        counts : list of 1D array-like, length Hroi*Wroi
-            For each ROI pixel, the 1-D array of event weights aligned with 
-            address
-        im_dims : tuple[int, int]
-            `(Hroi, Wroi)` — ROI size in scan pixels.
-        det_dims : tuple[int, int]
-            `(Hdet, Wdet)` — detector grid shape used to validate addresses 
-            and to optionally render an example detector frame.
-        mask : ndarray, shape (Hdet, Wdet)
-            Detector-space weighting mask (binary or float). The same mask is 
-            used
-            for all pixels in this function.
-        show : bool, default True
-            If True, display the unfiltered (`raw_sum`) and filtered 
-            (`filt_sum`) ROI images.
-        cmap : str, default 'gray'
-            Colormap for visualizarion.
-        return_example_idx : int or None, default None
-            If an integer `k` is provided, also return a `(Hdet, Wdet)`
-            detector image for pixel `k` (formed by accumulating `counts[k]` at
-            `(address[k] // Wdet, address[k] % Wdet)`).
-        n_workers : int or None, default None
-            Number of worker threads. Defaults to `min(32, os.cpu_count() or 4)`.
-        chunk_size : int, default 4096
-            Number of ROI pixels per worker task. Larger chunks amortize Python
-            overhead; smaller chunks can improve load balancing.
-
-        Returns
-        -------
-        froi : ndarray, shape (Hroi, Wroi), dtype float64
-            Filtered (masked) sums per ROI pixel.
-        rroi : ndarray, shape (Hroi, Wroi), dtype float64
-            **Only if** `return_example_idx` is not None: the unfiltered sums.
-        example_frame : ndarray, shape (Hdet, Wdet), dtype float64
-            **Only if** `return_example_idx` is not None and the index is valid:
-            detector image reconstructed for that pixel; otherwise `None`.
-        """
+        Apply a fixed detector-space mask to a Region of Interest (ROI) and 
+        compute per-pixel masked sums without reconstructing full 2D diff.
+        frames. Processing is parallelized over pixel chunks to reduce Python 
+        overhead.
+       
+        Overview
+        --------
+        Each ROI pixel is stored as sparse detector events:
+            - `self.p_address[i]`: 1-D array of detector linear addresses for
+              pixel *i*
+            - `self.p_count[i]`  : corresponding weights (e.g. hit counts)
+       
+       Given a detector-space mask `mask` (shape = `self.DET_DIMS`), 
+       the function computes for each ROI pixel:
+           raw_sum[i]  = sum(self.p_count[i])
+           filt_sum[i] = sum(self.p_count[i] * mask_flat[self.p_address[i]])
+       
+       Results are accumulated directly from sparse lists, avoiding the 
+       overhead of allocating a `(Hdet, Wdet)` array per pixel.
+       
+       Parameters
+       ----------
+       mask : ndarray, shape (Hdet, Wdet)
+           Detector-space weighting mask (binary or float). Applied identically 
+           to all ROI pixels.
+       n_workers : int or None, default None
+           Number of worker threads for parallel processing. Defaults to
+           `min(32, os.cpu_count() or 4)`.
+       chunk_size : int, default 4096
+           Number of ROI pixels per worker task. Larger chunks reduce Python
+           overhead; smaller chunks improve load balancing.
+       save_im : bool, default True
+           If True, save the filtered ROI image (`froi`) as an 8-bit PNG into
+           `self.out_dir`.
+       
+       Side Effects (attributes set on `self`)
+       ---------------------------------------
+       froi : np.ndarray, shape (Hroi, Wroi), float64
+           Filtered (masked) ROI image.
+       
+       Notes
+       -----
+       • The ROI dimensions are `self.NEW_DIMS = (Hroi, Wroi)`.  
+       • The detector grid is `self.DET_DIMS = (Hdet, Wdet)`; linear addresses 
+         are validated against `[0, Hdet*Wdet)`.  
+       • The `show` and `cmap` attributes of `self` control interactive display
+         of the unfiltered vs. filtered ROI images.
+       
+       Returns
+       -------
+       None
+       
+       Results are stored on `self` (see “Side Effects” above).
+       """
         address = self.p_address
         counts = self.p_count
         im_dims = self.NEW_DIMS
@@ -498,7 +489,7 @@ class Extractor:
         N = len(address)   # list-per-pixel style
         assert Hroi * Wroi == N, f"ROI dims {im_dims} != number of pixels {N}"
 
-        # Precompute flat mask for direct indexing with linear detector addresses
+        # Precompute flat mask for direct indexing with linear detector address
         mask_flat = np.asarray(mask, dtype=np.float64).ravel()
         det_size = Hdet * Wdet
 
@@ -555,7 +546,7 @@ class Extractor:
         
             # --- No filtration ---
             fig, ax = plt.subplots(constrained_layout=True)
-            im = ax.imshow(rroi, cmap=cmap, origin="lower")#, vmin=vmin, vmax=vmax)
+            im = ax.imshow(rroi, cmap=cmap, origin="lower")
             ax.set_title("ROI (no filtration)")
             ax.axis("off")
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -563,7 +554,7 @@ class Extractor:
         
             # --- Filtration ---
             fig, ax = plt.subplots(constrained_layout=True)
-            im = ax.imshow(froi, cmap=cmap, origin="lower")#, vmin=vmin, vmax=vmax)
+            im = ax.imshow(froi, cmap=cmap, origin="lower")
             ax.set_title("ROI (filtration)")
             ax.axis("off")
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -605,23 +596,83 @@ class Extractor:
                         chunk_size=4096,
                         save_im=True,
                         *,
-                        normalize=True,         # <-- NEW: per-frame dose normalization
-                        complement=False,       # <-- NEW: use outside-of-mask (tot - masked)
-                        invert_display=False,   # <-- NEW: flip intensities for visualization
-                        trim_pct=0.0            # <-- NEW: robust COM; e.g. 0.5 trims top 0.5% counts
+                        normalize=True,         # per-frame dose normalization
+                        complement=False,       # use outside-of-mask
+                        invert_display=False,   # flip intensities [visualize]
+                        trim_pct=0.0            # robust COM; 
+                                                # e.g. 0.5 trims top 0.5% 
                         ):
         """
-        Per-frame centered annulus/disk. Works directly on sparse events.
+        Apply a **per-frame centered annular/disk mask** to an ROI using sparse
+        detector events, computing masked sums without reconstructing full 2-D
+        diffraction frames. The annulus is re-centered per frame via center of
+        mass (COM), optionally smoothed with an exponential moving average.
     
-        NEW OPTIONS
-        -----------
-        normalize      : If True, use masked_fraction = masked_sum / total_sum.
-                         This usually makes BF/DF/HAADF resemble conventional STEM.
-        complement     : If True, use 'outside' of the mask: masked_sum = total_sum - inside_sum.
-                         Useful if your mask is defined as an exclusion zone.
-        invert_display : Visually invert the final image (no effect on saved raw values).
-        trim_pct       : Robustify center-of-mass (COM) by trimming brightest events when computing COM.
-                         Example: 0.5 keeps everything <= 99.5th percentile for COM calc.
+        Overview
+        --------
+        For each ROI pixel (sparse events from `self.p_address[i]`,
+        `self.p_count[i]`):
+          1) Compute a robust center-of-mass from detector coordinates, 
+             optionally trimming the top `trim_pct` of intensities to reduce 
+             outlier influence.
+          2) Form a disk or annulus with inner radius `lower * (Wdet/2)` and 
+             outer radius `upper * (Wdet/2)` around the COM (soft edges if 
+             `sigma` > 0).
+          3) Accumulate:
+               • raw_sum  = total intensity
+               • filt_sum = inside annulus (or outside, if `complement=True`)
+          4) Optionally normalize per frame by dividing `filt_sum` by `raw_sum`
+    
+        Parameters
+        ----------
+        lower, upper : float
+            Inner and outer radii of the annulus, expressed as fractions of the
+            detector half-width. (`lower=0.0, upper=1.0` → full disk).
+        sigma : float or None, default None
+            If given, apply Gaussian-softened edges to the annulus with width
+            `sigma` pixels. If None, a hard-edged annulus is used.
+        ema_alpha : float or None, default None
+            If in (0,1], apply exponential moving average to COM positions with
+            smoothing factor `ema_alpha`.
+        n_workers : int or None, default None
+            Number of worker threads. 
+            Defaults to `min(32, os.cpu_count() or 4)`.
+        chunk_size : int, default 4096
+            Number of ROI pixels per worker task. Larger chunks amortize 
+            overhead.
+        save_im : bool, default True
+            If True, save the filtered ROI image (`froi`) as an 8-bit PNG.
+        normalize : bool, default True
+            If True, store masked_fraction = inside_sum / total_sum.
+            If False, store absolute intensities.
+        complement : bool, default False
+            If True, use the outside of the annulus (total − inside).
+        invert_display : bool, default False
+            If True, invert intensities for display only 
+            (saved raw values unaffected).
+        trim_pct : float, default 0.0
+            Robustify COM calculation by clipping the top `trim_pct` fraction 
+            of weights. Example: `0.5` → use values ≤ 99.5th percentile for COM
+    
+        Side Effects (attributes set on `self`)
+        ---------------------------------------
+        froi : np.ndarray, shape (Hroi, Wroi), float64
+            Filtered ROI image (raw, not inverted).
+    
+        Notes
+        -----
+        • Input data are sparse detector events 
+          (`self.p_address`, `self.p_count`) stored per pixel in ROI order.  
+        • Detector grid is `self.DET_DIMS = (Hdet, Wdet)`; addresses validated
+          against `[0, Hdet*Wdet)`.  
+        • ROI shape is `self.NEW_DIMS = (Hroi, Wroi)`.  
+        • Saved PNG is automatically labeled as `BF`, `DF`, or `HAADF` 
+          depending on chosen radii.
+    
+        Returns
+        -------
+        None
+            Results are stored on `self` (see “Side Effects” above).
         """
     
         address = self.p_address
@@ -774,7 +825,7 @@ class Extractor:
             # suffix for filename
             if lower == 0.0:
                 suffix = "BF"
-            elif upper <= 0.5:
+            elif upper <= 1.0:
                 suffix = "DF"
             else:
                 suffix = "HADF"
@@ -787,7 +838,8 @@ class Extractor:
             img = froi_vis
             rmin, rmax = float(np.nanmin(img)), float(np.nanmax(img))
             if rmax > rmin:
-                img8 = np.clip((img-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+                img8 = np.clip(
+                    (img-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
             else:
                 img8 = np.zeros_like(img, dtype=np.uint8)
             Image.fromarray(img8).save(png_path)
