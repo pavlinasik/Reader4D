@@ -12,6 +12,10 @@ import ediff as ed
 import os
 from tqdm import tqdm
 from joblib import Parallel, delayed
+from scipy.special import erf
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import Reader4D.rois as r4dRoi
 
 
 class Annular:
@@ -128,6 +132,13 @@ class Annular:
                 self.CMAP
             )
         
+        elif self.mode==2:
+            
+            fimg = self.filter_centered_ROI(
+                lower=self.rLOWER, 
+                upper=self.rUPPER,
+                sigma=self.SIGMA)
+        
         if self.save_im:
             name = f"filtered_micrograph{mode}.png"
             plt.imsave(os.path.join(
@@ -141,6 +152,7 @@ class Annular:
 
         if verbose:
             print("[DONE : Application of virtual detectors]")
+    
     
     def create_mask(self, dim_x=256, dim_y=256, lower=0.01, upper=0.20,
                     coord_x=None, coord_y=None, show=True, blur_sigma=None):
@@ -667,6 +679,236 @@ class Annular:
         return fimg, master_mask
 
 
+    def filter_centered_ROI(self,
+                        lower=0.01, upper=0.20,
+                        sigma=None,
+                        ema_alpha=None,
+                        n_workers=None,
+                        chunk_size=4096,
+                        save_im=True,
+                        *,
+                        normalize=True,         # <-- NEW: per-frame dose normalization
+                        complement=False,       # <-- NEW: use outside-of-mask (tot - masked)
+                        invert_display=False,   # <-- NEW: flip intensities for visualization
+                        trim_pct=0.0            # <-- NEW: robust COM; e.g. 0.5 trims top 0.5% counts
+                        ):
+        """
+        Per-frame centered annulus/disk. Works directly on sparse events.
+    
+        NEW OPTIONS
+        -----------
+        normalize      : If True, use masked_fraction = masked_sum / total_sum.
+                         This usually makes BF/DF/HAADF resemble conventional STEM.
+        complement     : If True, use 'outside' of the mask: masked_sum = total_sum - inside_sum.
+                         Useful if your mask is defined as an exclusion zone.
+        invert_display : Visually invert the final image (no effect on saved raw values).
+        trim_pct       : Robustify center-of-mass (COM) by trimming brightest events when computing COM.
+                         Example: 0.5 keeps everything <= 99.5th percentile for COM calc.
+        """
+    
+        descriptors = np.asarray(self.descriptors)
+        packets     = np.asarray(self.packets)
+        flatN       = descriptors.shape[0]
+
+        # which packet value field to use
+        values_role = getattr(self, "values_role", "count")
+        
+        # normalize descriptor fields to flat int arrays ----
+        names = getattr(descriptors.dtype, "names", None)
+        if not names or ("packet_count" not in names):
+            raise TypeError(
+                "descriptors must be a structured array with 'packet_count' field")
+    
+        pc = np.asarray(
+            descriptors["packet_count"]
+            ).reshape(-1).astype(np.int64, copy=False)
+    
+        if "offset" in names:
+            off = np.asarray(
+                descriptors["offset"]
+                ).reshape(-1).astype(np.int64, copy=False)
+        else:
+            off = np.empty_like(pc, dtype=np.int64)
+            off[0] = 0
+            if pc.size > 1:
+                np.cumsum(pc[:-1], out=off[1:])
+    
+        if off.shape[0] != pc.shape[0]:
+            raise ValueError("offset and packet_count length mismatch")
+    
+        # prepare output containers ----
+        address = [None] * flatN
+        counts  = [None] * flatN
+    
+    
+        # main loop (fast enough; packets are already contiguous per pixel) ----
+        for i in range(flatN):
+            s = int(off[i]); l = int(pc[i]); e = s + l
+            if l <= 0:
+                address[i] = np.empty(0, dtype=np.int64)
+                counts[i]  = np.empty(0, dtype=np.float64)
+                continue
+    
+            p  = packets[s:e]
+            pa = p["address"].astype(np.int64, copy=False)
+            vc = p[values_role].astype(np.float64, copy=False)
+    
+  
+            address[i] = pa
+            counts[i]  = vc
+    
+        #  make available on self ----
+        self.p_address = address
+        self.p_count   = counts
+    
+        
+    
+        Wroi, Hroi = self.SCAN_DIMS
+        Hdet, Wdet = self.DET_DIMS
+        cmap = self.CMAP
+        show = self.show
+    
+        if self.verbose:
+            print("[INFO] Filtering ROI with per-frame centered annulus...")
+    
+        N = len(address)
+        assert Hroi * Wroi == N, f"ROI dims {Hroi,Wroi} != number of pixels {N}"
+    
+        # Radii in pixels (based on detector width like your original helper)
+        r_in  = 0.5 * Wdet * float(lower)
+        r_out = 0.5 * Wdet * float(upper)
+        soft  = (sigma is not None) and (float(sigma) > 0)
+        if soft:
+            sigma = float(sigma)
+            inv_s = 1.0 / (np.sqrt(2.0) * sigma)
+        
+        # unmasked total
+        raw_sums  = np.zeros(N, dtype=np.float64) 
+        
+        # masked (or outside) sum (possibly normalized)
+        filt_sums = np.zeros(N, dtype=np.float64) 
+    
+        # Optional EMA center starting at geometric center
+        cx_run = (Wdet - 1) / 2.0
+        cy_run = (Hdet - 1) / 2.0
+        use_ema = (ema_alpha is not None) and (0.0 < float(ema_alpha) <= 1.0)
+        if use_ema:
+            ema_alpha = float(ema_alpha)
+    
+        det_size = Hdet * Wdet
+        eps = 1e-12  # to avoid division by zero
+    
+        def _worker(start, end):
+            rs = np.zeros(end - start, dtype=np.float64)
+            fs = np.zeros(end - start, dtype=np.float64)
+            cx_loc, cy_loc = cx_run, cy_run  # local copies per-thread
+    
+            for j, idx in enumerate(range(start, end)):
+                a = np.asarray(address[idx], dtype=np.int64)
+                c = np.asarray(counts[idx],  dtype=np.float64)
+                if c.size == 0:
+                    continue
+    
+                # keep valid detector addresses
+                valid = (a >= 0) & (a < det_size)
+                if not np.all(valid):
+                    a = a[valid]; c = c[valid]
+                    if c.size == 0:
+                        continue
+    
+                y = a // Wdet
+                x = a %  Wdet
+    
+                # robust center-of-mass (optional trimming)
+                c_for_com = c
+                if trim_pct and trim_pct > 0:
+                    # cap very bright outliers for COM computation
+                    hi = np.percentile(c, 100.0 * (1.0 - float(trim_pct)))
+                    # use clipped weights only for center location 
+                    # (not for intensity)
+                    c_for_com = np.minimum(c, hi)
+    
+                tot = c.sum()
+                tot_com = c_for_com.sum()
+                if tot_com > 0:
+                    cx = (x * c_for_com).sum() / tot_com
+                    cy = (y * c_for_com).sum() / tot_com
+                    if use_ema:
+                        cx_loc = (1.0 - ema_alpha) * cx_loc + ema_alpha * cx
+                        cy_loc = (1.0 - ema_alpha) * cy_loc + ema_alpha * cy
+                    else:
+                        cx_loc, cy_loc = cx, cy
+    
+                # radial distances
+                dx = x - cx_loc
+                dy = y - cy_loc
+                r  = np.sqrt(dx*dx + dy*dy)
+    
+                if soft:
+                    w_inside = 0.5*(erf((r-r_in)*inv_s)-erf((r-r_out)*inv_s))
+                else:
+                    w_inside = ((r >= r_in) & (r <= r_out)).astype(np.float64)
+    
+                inside_sum = np.dot(c, w_inside)
+                masked_sum = inside_sum
+                if complement:
+                    # outside of the ring/disk
+                    masked_sum = tot - inside_sum   
+    
+                # dose-normalization per frame
+                if normalize:
+                    masked_sum = masked_sum / max(tot, eps)
+    
+                rs[j] = tot
+                fs[j] = masked_sum
+    
+            return start, end, rs, fs
+    
+        # Thread pool over chunks
+        if n_workers is None:
+            n_workers = min(32, (os.cpu_count() or 4))
+        ranges = [(s, min(s + chunk_size, N)) for s in range(0, N, chunk_size)]
+    
+        with ThreadPoolExecutor(max_workers=n_workers) as ex, tqdm(
+            total=N, desc="Reconstructing ROI", unit="px", dynamic_ncols=True
+        ) as pbar:
+            futures = [ex.submit(_worker, s, e) for (s, e) in ranges]
+            for fut in as_completed(futures):
+                s, e, rs, fs = fut.result()
+                raw_sums[s:e]  = rs
+                filt_sums[s:e] = fs
+                pbar.update(e - s)
+    
+        rroi = raw_sums.reshape(Hroi, Wroi)
+        froi = filt_sums.reshape(Hroi, Wroi)
+    
+        # optional visual inversion for display only
+        froi_vis = (np.max(froi) - froi) if invert_display else froi
+    
+        if show:
+            fig, ax = plt.subplots(constrained_layout=True)
+            im = ax.imshow(rroi, cmap=cmap, origin="lower")
+            ax.set_title("ROI (no filtration)"); ax.axis("off")
+            cb = fig.colorbar(im, 
+                              ax=ax, 
+                              fraction=0.046, 
+                              pad=0.04) 
+            cb.set_label("intensity", rotation=90)
+    
+            fig, ax = plt.subplots(constrained_layout=True)
+            im = ax.imshow(froi_vis, cmap=cmap, origin="lower")
+            ax.set_title("ROI (filtration, centered annulus)"); ax.axis("off")
+            cb = fig.colorbar(im,
+                              ax=ax, 
+                              fraction=0.046, 
+                              pad=0.04)
+            cb.set_label("intensity", rotation=90)
+            plt.show()
+    
+    
+        return froi
+         
+    
     def show_micrograph(self, 
                         img, 
                         title="Micrograph", 
