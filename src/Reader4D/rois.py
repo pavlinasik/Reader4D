@@ -1044,8 +1044,17 @@ class Extractor:
     
         # micrograph (fast)
         vals = np.asarray(packets[values_role], dtype=np.float64)
-        micro_sums = np.add.reduceat(vals, off)        # sum per frame
-        micro = micro_sums.reshape(H, W)               # row-major (y, x)
+        
+        # Sum per frame safely: only use frames with pc > 0 for reduceat
+        mask = pc > 0
+        micro_sums = np.zeros(n_frames, dtype=np.float64)
+        
+        if mask.any():
+            # off[mask] are valid start positions < len(vals)
+            micro_sums[mask] = np.add.reduceat(vals, off[mask])
+        
+        # Reshape to 2D micrograph
+        micro = micro_sums.reshape(H, W)
     
         # visualization image (optionally serpentine-flipped for display)
         if serpentine:
