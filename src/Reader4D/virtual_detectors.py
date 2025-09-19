@@ -8,6 +8,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter, shift
 import matplotlib.pyplot as plt
 from skimage.draw import disk
+from PIL import Image
 import ediff as ed
 import os
 from tqdm import tqdm
@@ -689,6 +690,7 @@ class Annular:
                         n_workers=None,
                         chunk_size=4096,
                         save_im=True,
+                        name_im=None,
                         *,
                         normalize=True,         # <-- NEW: per-frame dose normalization
                         complement=False,       # <-- NEW: use outside-of-mask (tot - masked)
@@ -908,7 +910,22 @@ class Annular:
             cb.set_label("intensity", rotation=90)
             plt.show()
     
-    
+        
+        if save_im:
+            png_path = os.path.join(self.out_dir, name_im)
+            # Save an 8-bit preview of froi_vis
+            img = froi_vis
+            rmin, rmax = float(np.nanmin(img)), float(np.nanmax(img))
+            if rmax > rmin:
+                img8 = np.clip(
+                    (img-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+            else:
+                img8 = np.zeros_like(img, dtype=np.uint8)
+            Image.fromarray(img8).save(png_path)
+            
+            if self.verbose:
+                print(f"[INFO] Saved PNG to: {png_path}")
+            
         return froi
          
     

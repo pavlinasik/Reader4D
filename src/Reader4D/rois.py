@@ -595,6 +595,7 @@ class Extractor:
                         n_workers=None,
                         chunk_size=4096,
                         save_im=True,
+                        name_im=None,
                         *,
                         normalize=True,         # per-frame dose normalization
                         complement=False,       # use outside-of-mask
@@ -822,27 +823,39 @@ class Extractor:
         self.froi = froi  # keep the raw (non-inverted) values
     
         if save_im:
-            # suffix for filename
-            if lower == 0.0:
-                suffix = "BF"
-            elif upper <= 1.0:
-                suffix = "DF"
+            if name_im is None:
+                # suffix for filename
+                if lower == 0.0:
+                    suffix = "BF"
+                elif upper <= 1.0:
+                    suffix = "DF"
+                else:
+                    suffix = "HADF"
+                base = os.path.splitext(self.name_roi)[0]
+                dims_tag = f"{int(self.NEW_DIMS[0])}x{int(self.NEW_DIMS[1])}"
+                png_path = os.path.join(
+                    self.out_dir, f"filtC_{dims_tag}_{base}_{suffix}.png")
+        
+                # Save an 8-bit preview of froi_vis
+                img = froi_vis
+                rmin, rmax = float(np.nanmin(img)), float(np.nanmax(img))
+                if rmax > rmin:
+                    img8 = np.clip(
+                        (img-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+                else:
+                    img8 = np.zeros_like(img, dtype=np.uint8)
+                Image.fromarray(img8).save(png_path)
             else:
-                suffix = "HADF"
-            base = os.path.splitext(self.name_roi)[0]
-            dims_tag = f"{int(self.NEW_DIMS[0])}x{int(self.NEW_DIMS[1])}"
-            png_path = os.path.join(
-                self.out_dir, f"filtC_{dims_tag}_{base}_{suffix}.png")
-    
-            # Save an 8-bit preview of froi_vis
-            img = froi_vis
-            rmin, rmax = float(np.nanmin(img)), float(np.nanmax(img))
-            if rmax > rmin:
-                img8 = np.clip(
-                    (img-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
-            else:
-                img8 = np.zeros_like(img, dtype=np.uint8)
-            Image.fromarray(img8).save(png_path)
+                png_path = os.path.join(self.out_dir, name_im)
+                # Save an 8-bit preview of froi_vis
+                img = froi_vis
+                rmin, rmax = float(np.nanmin(img)), float(np.nanmax(img))
+                if rmax > rmin:
+                    img8 = np.clip(
+                        (img-rmin)/(rmax-rmin)*255,0,255).astype(np.uint8)
+                else:
+                    img8 = np.zeros_like(img, dtype=np.uint8)
+                Image.fromarray(img8).save(png_path)
     
         return
 
