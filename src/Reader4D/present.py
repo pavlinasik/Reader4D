@@ -21,6 +21,7 @@ class Creator:
                  descriptors,
                  values_role,
                  out_dir,
+                 virtdet=None,
                  scan_dims = (1024, 768),
                  rLower = 0.01,
                  rUpper = 0.20,
@@ -56,23 +57,26 @@ class Creator:
         
         
         # Initialize virtual detector
-        self.VIRTDET = r4dVDet.Annular(
-            pattern,
-            self.packets,
-            self.descriptors,
-            self.values_role,
-            self.OUT_DIR,
-            scan_dims=self.SCAN_DIMS,
-            mode=2,
-            rLower=self.LOWER,
-            rUpper=self.UPPER,
-            sigma=self.SIGMA,
-            show=self.SHOW,
-            cmap=self.CMAP,
-            verbose=self.VERBOSE,
-            save_im=False,
-            name_im=self.NAME_IM
-            )
+        if virtdet is not None:
+            self.VIRTDET=virtdet
+        else:
+            self.VIRTDET = r4dVDet.Annular(
+                pattern,
+                self.packets,
+                self.descriptors,
+                self.values_role,
+                self.OUT_DIR,
+                scan_dims=self.SCAN_DIMS,
+                mode=2,
+                rLower=self.LOWER,
+                rUpper=self.UPPER,
+                sigma=self.SIGMA,
+                show=self.SHOW,
+                cmap=self.CMAP,
+                verbose=self.VERBOSE,
+                save_im=False,
+                name_im=self.NAME_IM
+                )
     
     def Excel(self,
               xlsx_path,
