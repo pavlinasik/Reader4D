@@ -774,7 +774,7 @@ class Annular:
         show = self.show
     
         if self.verbose:
-            print("[INFO] Filtering ROI with per-frame centered annulus...")
+            print("[INFO] Filtering micrograph with per-frame centered annulus...")
     
         N = len(address)
         assert Hroi * Wroi == N, f"ROI dims {Hroi,Wroi} != number of pixels {N}"
@@ -875,7 +875,7 @@ class Annular:
         ranges = [(s, min(s + chunk_size, N)) for s in range(0, N, chunk_size)]
     
         with ThreadPoolExecutor(max_workers=n_workers) as ex, tqdm(
-            total=N, desc="Reconstructing ROI", unit="px", dynamic_ncols=True
+            total=N, desc="Reconstructing micrograph", unit="px", dynamic_ncols=True
         ) as pbar:
             futures = [ex.submit(_worker, s, e) for (s, e) in ranges]
             for fut in as_completed(futures):
@@ -893,7 +893,7 @@ class Annular:
         if show:
             fig, ax = plt.subplots(constrained_layout=True)
             im = ax.imshow(rroi, cmap=cmap, origin="lower")
-            ax.set_title("ROI (no filtration)"); ax.axis("off")
+            ax.set_title("Micrograph (no filtration)"); ax.axis("off")
             cb = fig.colorbar(im, 
                               ax=ax, 
                               fraction=0.046, 
@@ -902,7 +902,7 @@ class Annular:
     
             fig, ax = plt.subplots(constrained_layout=True)
             im = ax.imshow(froi_vis, cmap=cmap, origin="lower")
-            ax.set_title("ROI (filtration, centered annulus)"); ax.axis("off")
+            ax.set_title("Micrograph (filtration, centered annulus)"); ax.axis("off")
             cb = fig.colorbar(im,
                               ax=ax, 
                               fraction=0.046, 
@@ -911,7 +911,7 @@ class Annular:
             plt.show()
     
         
-        if save_im:
+        if name_im:
             png_path = os.path.join(self.out_dir, name_im)
             # Save an 8-bit preview of froi_vis
             img = froi_vis
