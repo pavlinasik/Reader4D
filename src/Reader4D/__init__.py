@@ -11,6 +11,4 @@ __version__ = "0.0.1"
 import Reader4D.detectors
 import Reader4D.dtypes
 import Reader4D.convertor
-import Reader4D.virtual_detectors
-import Reader4D.rois
 import Reader4D.present
