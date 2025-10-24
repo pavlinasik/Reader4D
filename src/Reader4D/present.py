@@ -10,7 +10,7 @@ import cv2
 import pandas as pd
 import imageio
 from PIL import Image, ImageDraw, ImageFont
-import Reader4D.virtual_detectors as r4dVDet
+import Virtual4D.virtDets as v4dVDet
 
 class Creator:
     def __init__(self,
@@ -58,7 +58,7 @@ class Creator:
         if virtdet is not None:
             self.VIRTDET=virtdet
         else:
-            self.VIRTDET = r4dVDet.Annular(
+            self.VIRTDET = v4dVDet.Annular(
                 pattern,
                 self.packets,
                 self.descriptors,
