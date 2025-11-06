@@ -46,6 +46,7 @@ def save_all_diffractograms(packets, descriptors, output_path,
         The function performs disk I/O and does not return a value.
     """
     
+
     if not os.path.exists(output_path):
         os.makedirs(output_path)
         
@@ -54,7 +55,7 @@ def save_all_diffractograms(packets, descriptors, output_path,
     # Loop through every pattern index
     for i in tqdm(range(num_patterns), desc="Saving Diffractograms"):
         # 1. Reconstruct the diffractogram for the current index
-        diff_pattern, _ = det.timepix3.CSRLoader.get_diffractogram(
+        diff_pattern = get_diffractogram(
             packets, descriptors, i, scan_dims)
         
         # 2. Save the resulting array to a .dat file
@@ -163,4 +164,99 @@ def diff2hdf5(packets, descriptors, filename, verbose=1):
 
     except Exception as e:
         print(f"An error occurred during saving: {e}")
-        
+
+
+def get_diffractogram( 
+                      packets, descriptors, pattern_index,
+                      scan_dims=(1024, 768),
+                      detector_dims=(256, 256),
+                      dtype=np.uint32):
+        """
+        Recovers the 2D diffraction pattern for a single pixel of the scan 
+        image.
+    
+        Parameters
+        ----------
+        packets : numpy.ndarray
+            The raw packet data from the .advb file.
+        descriptors : numpy.ndarray
+            The descriptor data from the .advb.desc file.
+        pattern_index : integer
+            Index of the diffractogram to be reconstructed.
+        scan_dims : tuple, optional
+            The (width, height) of the overall scan grid.
+        detector_dims : tuple, optional
+            The (width, height) of the detector.
+    
+        Returns
+        -------
+        numpy.ndarray
+            A 2D array (256x256) representing the diffraction pattern.
+            
+        """
+        # --- sanity on dims ---
+        if (not isinstance(scan_dims, (tuple, list))) or len(scan_dims) != 2:
+            raise TypeError(
+                f"scan_dims must be (width,height), got {scan_dims}")
+        if (not isinstance(detector_dims, (tuple, list))) or \
+            len(detector_dims) != 2:
+            raise TypeError(
+                f"detector_dims must be (width,height), got {detector_dims}")
+        if not isinstance(pattern_index, int):
+            raise TypeError("pattern_index must be an integer.")
+    
+        det_width, det_height = map(int, detector_dims)   # (Wdet, Hdet)
+        n_pkts = int(packets.shape[0])
+    
+        # normalize descriptors to 1D arrays pc (packet_count) and off (offset) 
+        desc = np.asarray(descriptors)
+        if "packet_count" not in getattr(desc.dtype, "names", ()):
+            raise TypeError("descriptors must have field 'packet_count'.")
+    
+        pc = np.asarray(desc["packet_count"], dtype=np.int64).reshape(-1)
+        n_frames = pc.size
+        if not (0 <= pattern_index < n_frames):
+            raise IndexError("pattern_index out of bounds.")
+    
+        # prefer provided offset if it matches packets length;otherwise rebuild
+        use_provided_off = ("offset" in desc.dtype.names)
+        if use_provided_off:
+            off = np.asarray(desc["offset"], dtype=np.int64).reshape(-1)
+            # check consistency only on the last frame to avoid O(N) sums
+            if off[-1] + pc[-1] != n_pkts:
+                use_provided_off = False
+    
+        if not use_provided_off:
+            off = np.empty_like(pc, dtype=np.int64)
+            if pc.size:
+                off[0] = 0
+                if pc.size > 1:
+                    np.cumsum(pc[:-1], out=off[1:])
+    
+        # slice this frame
+        s = int(off[pattern_index])
+        e = s + int(pc[pattern_index])
+        if s < 0 or e < s or e > n_pkts:
+            # out of range → treat as empty
+            return np.zeros((det_height, det_width), dtype=dtype), 0
+    
+        frame_pkts = packets[s:e]
+    
+        # reconstruct diffractogram
+        # NOTE: image shape must be (Hdet, Wdet) for (y,x) indexing
+        img = np.zeros((det_height, det_width), dtype=dtype)
+        if frame_pkts.size:
+            addr = frame_pkts["address"].astype(np.int64, copy=False)
+            field = "itot" or "count"
+            vals = frame_pkts[field]
+    
+            det_size = det_width * det_height
+            valid = (addr >= 0) & (addr < det_size)
+            if not np.all(valid):
+                addr = addr[valid]; vals = vals[valid]
+    
+            # accumulate into raveled image for speed, then done
+            np.add.at(img.ravel(), addr, vals)
+    
+
+        return img        
