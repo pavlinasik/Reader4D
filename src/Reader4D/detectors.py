@@ -29,6 +29,7 @@ from .dtypes import TP3_DTYPE_MAP as _DTYPE_MAP
 
 # Import other Reader4D modules:
 import Reader4D.convertor as r4dConv
+import Reader4D.visualizer as r4dVisu
 
 
     
@@ -182,7 +183,7 @@ class Timepix3:
             if verbose:
                 print("[INFO] Displaying sample diffractograms...")
                 
-            self.example, _ = self.show_random_diffractograms(
+            self.example, _ = r4dVisu.show_random_diffractograms(
                 packets=self.packets,
                 descriptors=self.descriptors, 
                 scan_dims=self.SCAN_DIMS,
@@ -382,6 +383,8 @@ class Timepix3:
         if np.any(row_counts > np.iinfo(np.uint32).max):
             raise ValueError("A row has >2^32-1 packets; no fit into uint32.")
         desc["packet_count"] = row_counts.astype(np.uint32, copy=False)
+        
+        self.desc = desc
 
         # Build packets (address, count, itot)
         pkt = np.empty(nnz, dtype=ACQ_DATA_PACKET_DTYPE)
@@ -394,6 +397,8 @@ class Timepix3:
             pkt["count"] = 0
         else:
             raise ValueError("values_role must be 'count' or 'itot'")
+        
+        self.pkt = pkt
 
         # Optional detector bounds check if sig_shape provided
         if sig_shape:
@@ -638,88 +643,6 @@ class Timepix3:
               f"{g('packets_per_frame_max')}")
         print(f"      nonempty_frames     : {g('nonempty_frames')} "
               f"({100.0 * g('occupancy', 0.0):.1f}% occupancy)")
-
-
-    def show_random_diffractograms(self, 
-               packets, descriptors, scan_dims=(1024, 768), num_patterns=10, 
-               rows=2, cols=5, csquare=256, icut=5):
-        """
-        Reconstructs and displays a random sample of diffraction patterns 
-        directly from the raw packet data.
-        
-        Parameters
-        ----------
-        packets : numpy.ndarray
-            The raw packet data from the .advb file.
-        descriptors : numpy.ndarray
-            The descriptor data from the .advb.desc file.
-        scan_dims : tuple, optional
-            The dimensions (width, height) of the original scan grid.
-        num_patterns : int, optional
-            The total number of patterns to display.
-        rows, cols : int, optional
-            The dimensions of the subplot grid.
-        csquare : int, optional
-            Side length of a central square to crop from each pattern for 
-            display.
-            
-        Returns
-        -------
-        img : numpy.ndarray
-            Last displayed image.
-        """
-        scan_width, scan_height = scan_dims
-        
-        if rows * cols < num_patterns:
-            print("Warning: Subplot grid is too small.")
-            num_patterns = rows * cols
-        
-        fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-        axes = axes.flatten()
-        sums = []
-        
-        for i in range(num_patterns):
-            try:
-                # Pick a random valid pattern index
-                pattern_index = np.random.randint(0, len(descriptors))
-        
-                # Reconstruct the pattern on-the-fly
-                img, s = self.get_diffractogram(
-                        packets, 
-                        descriptors, 
-                        pattern_index, 
-                        scan_dims)
-                
-                img = np.where(img > icut, icut, img)
-        
-                sums.append(s)
-                
-                # Crop the central square of the image
-                img_height, img_width = img.shape
-                start_x = img_width // 2 - csquare // 2
-                start_y = img_height // 2 - csquare // 2
-                cimg = img[start_y:start_y+csquare, start_x:start_x+csquare]
-        
-                # Plot the cropped image on the i-th subplot
-                ax = axes[i]
-                ax.imshow(cimg, cmap='viridis', origin='lower')
-                ax.set_title(f"Pattern ID:({pattern_index})")
-                ax.axis("off")
-        
-            except Exception as e:
-                # General error handling
-                print(f"An error occurred for pattern ({pattern_index}): {e}")
-                axes[i].axis("off")
-                axes[i].set_title(f"({pattern_index}) - Error")
-                
-        # Hide any unused subplots
-        for j in range(num_patterns, len(axes)):
-            axes[j].axis('off')
-        
-        plt.tight_layout()
-        plt.show()
-        
-        return img, sums
 
 
     def get_diffractogram(self, 
@@ -972,7 +895,7 @@ class Timepix3:
         # Optionally display reconstructed images 
         if show:
             if np.sum(count_image) != 0:
-                self.show_micrograph(
+                r4dVisu.show_micrograph(
                     count_image,
                     title="Hit Counts Micrograph",
                     cmap=cmap,
@@ -985,7 +908,7 @@ class Timepix3:
                 print("[INFO] Hit Counts not available.")
                     
             if np.sum(itot_image) != 0:
-                self.show_micrograph(
+                r4dVisu.show_micrograph(
                     itot_image,
                     title="iToT Micrograph",
                     cmap=cmap,
@@ -1008,51 +931,7 @@ class Timepix3:
             return count_image, itot_image
     
     
-    def show_micrograph(self, img, 
-                        title="Micrograph", 
-                        cmap="gray", 
-                        save=False, 
-                        filename=None, 
-                        output_dir=None,
-                        show=True):
-        """
-        Display and optionally save a micrograph.
 
-        Parameters
-        ----------
-        img : 2D array
-            Image to display.
-        title : str
-            Title for the plot.
-        cmap : str
-            Colormap to use.
-        save : bool
-            If True, save the image.
-        filename : str
-            Filename to save as (e.g. "filtered.png").
-        output_dir : str
-            Directory where to save the image.
-        show : bool
-            If True, display the image.
-        """
-        if show:
-            plt.figure(figsize=(6, 6))
-            plt.imshow(img, cmap=cmap, origin='lower')
-            plt.title(title)
-            plt.axis("off")
-            plt.tight_layout()
-            plt.show()
-
-        if save:
-            if filename is None:
-                raise ValueError(
-                    "If 'save' is True, you must provide a filename.")
-            if output_dir is None:
-                output_dir = os.getcwd()
-            os.makedirs(output_dir, exist_ok=True)
-            path = os.path.join(output_dir, filename)
-            plt.imsave(path, img, cmap=cmap)
-            print(f"[INFO] Saved: {path}")
             
             
     def ADVBLoader(self):
