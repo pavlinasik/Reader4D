@@ -1,9 +1,69 @@
-# -*- coding: utf-8 -*-
 """
-Created on Mon Sep  1 08:15:59 2025
+This module provides the :class:`Reader4D.detectors` loaders, high-level 
+convenience wrappers for working with 4D-STEM datasets.
 
-@author: p-sik
+The primary supported input format is a CSR triplet written by the acquisition
+pipeline:
+
+- ``indptr.raw``   : CSR row pointer (length = n_frames + 1)
+- ``indices.raw``  : detector addresses for nonzero events (length = nnz)
+- ``values.raw``   : per-event values (counts or iToT; length = nnz)
+- ``*.toml``       : sidecar metadata describing shapes, dtypes, acquisition
+  parameters
+
+After loading, the data are exposed in a downstream-friendly representation:
+
+- ``packets``      : structured array with dtype
+  :data:`~Reader4D.dtypes.TP3_ACQ_DATA_PACKET_DTYPE`
+  and fields ``('address', 'count', 'itot')``
+- ``descriptors``  : structured array with dtype
+  :data:`~Reader4D.dtypes.TP3_BIN_DESCRIPTOR_DTYPE`
+  and fields ``('offset', 'packet_count')``
+- ``header``       : a flat metadata/statistics dict derived from the TOML and
+  from basic CSR statistics
+
+The loader supports optional visualization and micrograph reconstruction
+(count and iToT), and can optionally export derived outputs to disk via
+:mod:`Reader4D.convertor` and :mod:`Reader4D.visualizer`.
+
+Quick start
+-----------
+Load a CSR dataset (with TOML sidecar) and preview diffractograms::
+
+    import Reader4D.detectors as r4dDet
+
+    detector = r4dDet.Timepix3(
+        in_dir=r"C:\\path\\to\\csr_dataset",
+        values_role="count",
+        show=True,
+        micrographs=True,
+        progress=True,
+        verbose=1,
+    )
+
+    packets = detector.packets
+    descriptors = detector.descriptors
+    header = detector.header
+
+Reconstruct a single diffractogram for a scan position::
+
+    img, total = detector.get_diffractogram(
+        packets=detector.packets,
+        descriptors=detector.descriptors,
+        pattern_index=0,
+        scan_dims=detector.SCAN_DIMS,
+        detector_dims=detector.DET_DIMS,
+    )
+
+Notes
+-----
+- This module assumes that ``packets['address']`` is a linear index into the
+  detector plane (0..W*H-1). If your acquisition encodes addresses differently,
+  you must decode the address prior to accumulation.
+- The CSR arrays are memory-mapped for efficient access and may be prefetched
+  into the OS cache to reduce random I/O overhead for interactive exploration.
 """
+
 import glob
 import os
 import numpy as np
@@ -35,392 +95,468 @@ import Reader4D.visualizer as r4dVisu
     
 class Timepix3:
     """
-    Convenience wrapper for loading a 4D-STEM dataset stored as a CSR triplet
-    (`indptr.raw`, `indices.raw`, `values.raw`), validating it, inferring scan
-    and detector dimensions, and optionally previewing random diffractograms.
+    High-level loader for Timepix3 4D-STEM datasets stored as a CSR triplet.
 
-    Parameters
+    The loader expects a directory containing a CSR triplet (``indptr.raw``,
+    ``indices.raw``, ``values.raw``) and a TOML sidecar (``*.toml``) describing
+    dtypes and shapes. Data are exposed in a downstream-friendly form as
+    ``packets`` and ``descriptors`` structured arrays, plus an optional
+    normalized ``header`` dictionary.
+
+    Attributes
     ----------
-    in_dir : str or pathlib.Path
-        Directory containing the CSR triplet files (and optionally a TOML
-        sidecar). Filenames are given by `indptr`, `indices`, and `data`.
-    out_dir : str or pathlib.Path, optional
-        Output directory for derived artifacts/figures. Defaults to `in_dir`.
-    indptr : str, default "indptr.raw"
-        Filename of the CSR row pointer array (int64), length = n_frames + 1.
-    indices : str, default "indices.raw"
-        Filename of the CSR column indices (detector addresses; int32), 
-        length = nnz.
-    data : str, default "values.raw"
-        Filename of the CSR data values (counts or iToT; int32), length = nnz.
-    data_type : str, default "csr"
-        Data type of input data from timepix3 to be loaded. Currently, only 
-        "csr" is available
-    scan_dims : tuple[int, int] or None, optional
-        (width, height) of the scan grid. If None, inferred from header.
-        Internally stored as `self.SCAN_DIMS`.
-    det_dims : tuple[int, int] or None, optional
-        (det_width, det_height) of the detector grid. If None, inferred from 
-        header. Internally stored as `self.DET_DIMS`.
-    h5file : str
-        Filename of a .h5 export for MATLAB to the out_dir. If None, no export 
-        is done. Default is None.
-    cmap : str, default "gray"
-        Colormap used for preview figures.
-    show : bool, default True
-        If True, display a few random diffractograms after loading.
-    progress : bool, default True
-        If True, show tqdm progress while loading/prefetching raw arrays.
-    verbose : int, default 1
-        Verbosity level; >0 prints basic status messages.
-    return_header : bool, default True
-        If True, `CSRLoader` returns a parsed header/stats dict as `self.header`.
-    print_header : bool, default True
-        If True and a header is available, pretty-prints it after loading.
+    in_dir : str or os.PathLike
+        Input directory containing CSR files and a TOML sidecar.
 
-    """    
-    def __init__(self,
-                in_dir, 
-                out_dir       = None,
-                indptr        = "indptr.raw",
-                indices       = "indices.raw",
-                data          = "values.raw",
-                values_role   = "count",
-                data_type     = "csr",
-                scan_dims     = None,
-                det_dims      = None,
-                h5file        = None,
-                cmap          = "gray",
-                show          = True,
-                progress      = True,
-                verbose       = 1,
-                return_header = True,
-                print_header  = True,
-                micrographs   = False,
-                ):
-        
-        ######################################################################
-        # PRIVATE FUNCTION: Initialize CSRTriplet object.
-        # The parameters are described above in class definition.
-        ######################################################################
-        
-        ## Initialize input attributes ---------------------------------------
-        self.in_dir = in_dir
-        
-        if out_dir is None:
-            self.out_dir = self.in_dir
-        else:
-            self.out_dir = out_dir
-            
-        self.triplet1 = indptr
-        self.triplet2 = indices
-        self.triplet3 = data
-        self.values_role = values_role
-        self.data_type = data_type
-        self.SCAN_DIMS = scan_dims
-        self.DET_DIMS = det_dims
-        self.h5file = h5file
-        self.cmap = cmap
-        self.show = show
-        self.progress = progress
-        self.verbose = verbose
-        self.return_header = return_header
-        self.print_header = print_header
-        
+    out_dir : str or os.PathLike
+        Output directory used for derived artifacts (plots, exports). If not
+        provided, defaults to ``in_dir``.
+
+    indptr_file : str
+        Filename of the CSR row-pointer array. Typically ``"indptr.raw"``.
+        The row-pointer array has length ``n_frames + 1`` and must be
+        non-decreasing.
+
+    indices_file : str
+        Filename of the CSR indices array. Typically ``"indices.raw"``.
+        Holds detector addresses for each packet/event.
+
+    values_file : str
+        Filename of the CSR values array. Typically ``"values.raw"``.
+        Holds per-packet values interpreted as either counts or iToT.
+
+    values_role : {"count", "itot"}
+        How ``values_file`` should be mapped into the packet structure.
+        If ``"count"``, values populate ``packets["count"]`` and
+        ``packets["itot"]`` is zeroed. If ``"itot"``, the inverse mapping
+        is used.
+
+    scan_dims : tuple[int, int] or None
+        Scan grid dimensions stored as ``(width, height)``. If None, inferred
+        from the TOML ``nav_shape`` (which is commonly stored as ``(H, W)``).
+
+    det_dims : tuple[int, int] or None
+        Detector dimensions stored as ``(width, height)`` (recommended
+        convention). If None, inferred from the TOML ``sig_shape``. If your
+        TOML stores detector shape as ``(Hdet, Wdet)``, this class normalizes
+        it to ``(Wdet, Hdet)`` for consistency.
+
+    packets : numpy.ndarray
+        Structured array of dtype
+        :data:`~Reader4D.dtypes.TP3_ACQ_DATA_PACKET_DTYPE` with fields
+        ``('address', 'count', 'itot')`` and length ``nnz``.
+
+    descriptors : numpy.ndarray
+        Structured array of dtype
+        :data:`~Reader4D.dtypes.TP3_BIN_DESCRIPTOR_DTYPE` with fields
+        ``('offset', 'packet_count')`` and length ``n_frames``.
+
+    header : dict or None
+        Normalized metadata/statistics dictionary assembled from TOML and
+        derived CSR statistics. Only available when ``return_header=True``.
+
+    output_dir : str
+        Resolved output directory used internally for saving figures and other
+        derived artifacts. A subfolder may be chosen based on ``values_role``.
+
+    Notes
+    -----
+    - CSR arrays are loaded using ``numpy.memmap`` to avoid up-front copies.
+    - Packet addresses are assumed to be linear indices into the detector plane
+      (0..W*H-1) unless your acquisition format specifies otherwise.
+    """
+
+    def __init__(
+        self,
+        in_dir,
+        out_dir=None,
+        indptr="indptr.raw",
+        indices="indices.raw",
+        data="values.raw",
+        values_role="count",
+        data_type="csr",
+        scan_dims=None,
+        det_dims=None,
+        h5file=None,
+        cmap="gray",
+        show=True,
+        progress=True,
+        verbose=1,
+        return_header=True,
+        print_header=True,
+        micrographs=False,
+    ):
+        """
+        Initialize and load a Timepix3 CSR dataset.
     
-        # Load CSR triplet ----------------------------------------------------
+        Notes
+        -----
+        This initializer intentionally exposes only the *dataset state* 
+        as instance attributes (e.g., `packets`, `descriptors`, `scan_dims`). 
+        Configuration options controlling the load process (e.g., `verbose`, 
+        `progress`) are used during initialization but are not persisted 
+        as public attributes to keep the object API minimal and consistent.
+        """
+    
+        # ---- Public attributes (dataset state) — always defined
+        self.in_dir = in_dir
+        self.out_dir = in_dir if out_dir is None else out_dir
+    
+        # ---- Canonical dimension names
+        self.scan_dims = scan_dims  # (W, H) or None
+        self.det_dims = det_dims    # (W, H) or None
+    
+        self.values_role = str(values_role).lower()
+        if self.values_role not in ("count", "itot"):
+            raise ValueError("values_role must be 'count' or 'itot'")
+    
+        # ---- Results (always exist, may remain None until loaded)
+        self.packets = None
+        self.descriptors = None
+        self.header = None
+    
+        # ---- Derived outputs / previews (always exist)
+        self.output_dir = None
+        self.example = None
+        self.count = None
+        self.itot = None
+        self.image = None
+        
+        self.show = show
+    
+        # Validate supported input type (do not store as attribute)
+        if str(data_type).lower() != "csr":
+            raise ValueError("Only data_type='csr' is currently supported")
+    
+        # ---- Load CSR triplet 
+        # filenames are constructor args; no need to store them as attributes 
+        # unless you explicitly want them as public API
         if verbose:
             print("[INFO] Loading raw data...")
-        if self.data_type == "csr":
-            self.packets, self.descriptors, self.header = self.CSRLoader(
-                                            indptr=self.triplet1,
-                                            indices=self.triplet2,
-                                            data=self.triplet3,
-                                            values_role=self.values_role,
-                                            progress=self.progress,
-                                            return_header=self.return_header
-                                            )
-        else:
-            print("Loader is not ready yet.")
-        
-        # Print header information optionally ---------------------------------
-        if print_header and self.header is not None:
-            self.print_csr_header(self.header)
-        
-        # Set dimensions automatically based on the header information --------
+    
+        packets, descriptors, header = self.CSRLoader(
+            indptr=indptr,
+            indices=indices,
+            data=data,
+            values_role=self.values_role,
+            progress=bool(progress),
+            return_header=bool(return_header),
+        )
+    
+        self.packets = packets
+        self.descriptors = descriptors
+        self.header = header
+    
+        # Infer dimensions (normalize to (W, H)) if missing and header present
+        # The TOML convention: nav_shape=(H, W), sig_shape=(Hdet, Wdet)
         if self.header is not None:
-            # (a) scanning dimensions
-            self.SCAN_DIMS = self.header['nav_shape'][::-1]
-
-            # (b) detector dimensions
-            self.DET_DIMS = self.header['sig_shape']
-
-        # Define output folder (change if needed) -----------------------------
-        # Base inside the input data folder
+            if self.scan_dims is None and "nav_shape" in self.header:
+                h, w = map(int, self.header["nav_shape"])
+                self.scan_dims = (w, h)
+    
+            if self.det_dims is None and "sig_shape" in self.header:
+                hdet, wdet = map(int, self.header["sig_shape"])
+                self.det_dims = (wdet, hdet)
+    
+        # ---- Output directory conventions (derived artifact location)
         base_output = os.path.join(self.out_dir, "Reader4D_output")
         os.makedirs(base_output, exist_ok=True)
-        
-        # Choose subfolder based on values_role
-        if self.values_role == "count":
-            self.output_dir = os.path.join(base_output, "count")
-        elif self.values_role == "itot":
-            self.output_dir = os.path.join(base_output, "itot")
-        else:
-            self.output_dir = base_output  # fallback if needed
-        
+    
+        role_folder = "count" if self.values_role == "count" else "itot"
+        self.output_dir = os.path.join(base_output, role_folder)
         os.makedirs(self.output_dir, exist_ok=True)
-
-        # Convert to a .h5 file for MATLAB optionally -------------------------
-        if self.h5file is not None:
-            r4dConv.diff2hdf5(
-                self.packets, 
-                self.descriptors, 
-                filename=self.output_dir+"\\"+self.h5file,
-                verbose=self.verbose)
-            
-        # Show ranfom diffractograns optionally -------------------------------
-        if show:
+    
+        # ---- Optional: print header (do not store print_header flag)
+        if bool(print_header) and self.header is not None:
+            self.print_csr_header(self.header)
+    
+        # ---- Optional: export to HDF5 (do not store h5file flag)
+        if h5file is not None:
+            r4dConv.csr2hdf5(
+                csr_path=None,
+                packets=self.packets,
+                descriptors=self.descriptors,
+                header=self.header,
+                output_path=self.out_dir,
+                filename=h5file,
+                overwrite=True,
+                progress=bool(progress),
+            )
+    
+        # ---- Optional: preview diffractograms (do not store show/cmap flags)
+        
+        if bool(show):
             if verbose:
                 print("[INFO] Displaying sample diffractograms...")
-                
             self.example, _ = r4dVisu.show_random_diffractograms(
                 packets=self.packets,
-                descriptors=self.descriptors, 
-                scan_dims=self.SCAN_DIMS,
-                )
+                descriptors=self.descriptors,
+                scan_dims=self.scan_dims if \
+                    self.scan_dims is not None else (1024, 768),
+                icut=None,
+            )
+    
+        # ---- Optional: micrograph reconstruction
+        # always assign `self.image` consistently if computed
         
-        if micrographs:
-            if self.verbose:
-                print("[INFO] Reconstructing Hit Count and iToT micrographs...")
+        if bool(micrographs):
+            if verbose:
+                print(
+                    "[INFO] Reconstructing Hit Count and iToT micrographs..."
+                    )
+    
             self.count, self.itot = self.get_count_itot(
                 packets=self.packets,
                 descriptors=self.descriptors,
-                scan_dims=self.SCAN_DIMS,
-                show=self.show,
-                cmap=self.cmap
+                scan_dims=self.scan_dims if \
+                    self.scan_dims is not None else (1024, 768),
+                show=bool(show),
+                cmap=cmap,
             )
-
-            # Save Hit Count and iToT images
+    
             if self.count is not None:
-                plt.imsave(os.path.join(
-                    self.output_dir, "hit_count.png"), 
-                    self.count, 
-                    cmap=self.cmap
-                    )
-
+                plt.imsave(
+                    os.path.join(self.output_dir, "hit_count.png"),
+                    self.count,
+                    cmap=cmap,
+                )
             if self.itot is not None:
-                plt.imsave(os.path.join(
-                    self.output_dir, "itot.png"),
-                    self.itot, 
-                    cmap=self.cmap
-                    )
-                
-            if self.verbose:
-                print(f"[INFO] Saved images to {self.output_dir}")
-            
-            if self.values_role == "count":
-                self.image = self.count
-            elif self.values_role == "itot":
-                self.image = self.itot
-            
+                plt.imsave(
+                    os.path.join(self.output_dir, "itot.png"),
+                    self.itot,
+                    cmap=cmap,
+                )
+    
+            self.image = self.count if \
+                self.values_role == "count" else self.itot
+    
         if verbose:
             print("[DONE : Loading data]")
-            
-            
-    def CSRLoader(self,
-                    indptr = "indptr.raw",
-                    indices = "indices.raw",
-                    data = "values.raw",
-                    values_role="count",        
-                    progress=True,
-                    prefetch_mb=256,
-                    return_header=False):
-        """
-        Load a CSR triplet described by a sidecar TOML file and convert it to 
-        your downstream-friendly representation:
-          - descriptors: structured array with fields
-            ('offset': uint64, 'packet_count': uint32)
-            1 row per scan pixel/frame  
-          - packets: structured array with fields
-            ('address': uint32, 'count': uint32, 'itot': uint32)
-            1 entry per nonzero
 
-        The CSR arrays are memory-mapped (no upfront copy). Optionally, 
-        the function sequentially prefetches each memmap in large blocks.
+
+    def CSRLoader(
+        self,
+        indptr="indptr.raw",
+        indices="indices.raw",
+        data="values.raw",
+        values_role="count",
+        progress=True,
+        prefetch_mb=256,
+        return_header=False,
+    ):
+        """
+        Load a CSR triplet from ``self.in_dir`` using TOML metadata.
+
+        This method reads a TOML sidecar (``*.toml``) from ``self.in_dir`` to
+        determine file names, dtypes, and shapes. The CSR triplet is memory-
+        mapped (no up-front copy) and converted into:
+
+        - ``descriptors``: structured array with dtype
+          :data:`~Reader4D.dtypes.TP3_BIN_DESCRIPTOR_DTYPE` and fields
+          ``('offset', 'packet_count')`` (one row per frame/scan pixel)
+        - ``packets``: structured array with dtype
+          :data:`~Reader4D.dtypes.TP3_ACQ_DATA_PACKET_DTYPE` and fields
+          ``('address', 'count', 'itot')`` (one row per nonzero/packet)
 
         Parameters
         ----------
-        folder : str
-            Directory containing the CSR files and a matching *.toml produced 
-            by the acquisition script. The TOML is expected to include:
+        indptr : str, optional
+            Default filename for the CSR row-pointer file if not specified in
+            TOML (default ``"indptr.raw"``).
 
-            - [params]: may define nav_shape = [H, W], sig_shape = [Hdet,Wdet],
-              optional filetype, and optional acquisition metadata 
-              (e.g., dwell_time_ns,threshold, bias).
-            - [raw_csr]: file names and dtypes for the CSR triplet, e.g.
-              indptr_file, indices_file, data_file,
-              indptr_dtype, indices_dtype, data_dtype.
+        indices : str, optional
+            Default filename for the CSR indices file if not specified in TOML
+            (default ``"indices.raw"``).
+
+        data : str, optional
+            Default filename for the CSR values file if not specified in TOML
+            (default ``"values.raw"``).
 
         values_role : {"count", "itot"}, optional
-            How to map values.raw into the output packet fields. 
-            If "count", values are written to packets['count'] and 
-            packets['itot'] is zeroed. 
-            If "itot", values go to packets['itot'] and packets['count'] is
-            zeroed. 
-            Default is "count".
-            
+            How to map CSR values into the packet fields. If ``"count"``,
+            values populate ``packets["count"]`` and ``packets["itot"]`` is set
+            to zero. If ``"itot"``, values populate ``packets["itot"]`` and
+            ``packets["count"]`` is set to zero.
+
         progress : bool, optional
-            If True, prefetch each memmap with a tqdm progress bar. 
-            Default True.
+            If True, prefetches memory maps using tqdm progress bars.
+
         prefetch_mb : int, optional
-            Block size (MiB) used for prefetching sequential reads. Larger 
-            values reduce Python overhead but increase each I/O burst. 
-            Default 256.
+            Block size (MiB) used for sequential prefetching. Larger values
+            reduce Python overhead but increase I/O burst size.
+
         return_header : bool, optional
-            If True, also return a friendly header/stats dict assembled from
-            the TOML and derived CSR statistics (via _normalize_header). 
-            Default False.
+            If True, returns a normalized header/stats dictionary as a third
+            result.
 
         Returns
         -------
         packets : numpy.ndarray
-            Structured array of shape (nnz,) with dtype compatible with your
-            acq_data_packet_dtype; fields: 'address', 'count', 'itot'.
+            Structured array of shape ``(nnz,)`` with dtype
+            :data:`~Reader4D.dtypes.TP3_ACQ_DATA_PACKET_DTYPE`.
+
         descriptors : numpy.ndarray
-            Structured array of shape (n_frames,) with dtype compatible with 
-            your bin_descriptor_dtype; fields: 'offset', 'packet_count'.
-        header : dict, optional
-            Only if return_header=True; a flat dict suitable for printing,
-            including shapes, byte sizes, and simple stats.
+            Structured array of shape ``(n_frames,)`` with dtype
+            :data:`~Reader4D.dtypes.TP3_BIN_DESCRIPTOR_DTYPE`.
+
+        header : dict or None
+            Normalized header/stats dictionary if ``return_header=True``,
+            otherwise None.
+
         """
-        
-        # Initialize variables
         folder = self.in_dir
-        
-        # Helper functions
+
         def _find_one(path, pattern):
-            """ 
-            Return the first filesystem entry matching a glob pattern inside 
-            a directory. Results are sorted lexicographically to make the 
-            choice deterministic.
-            """
+            """ Return the first filesystem entry matching a glob pattern 
+            in a directory. The results are sorted lexicographically to make
+            the selection deterministic."""
             hits = sorted(glob.glob(os.path.join(path, pattern)))
-            
             return hits[0] if hits else None
-        
-        # Raise Errors
+
         if not os.path.isdir(folder):
             raise FileNotFoundError(f"Folder not found: {folder}")
 
-        # Find TOML
         toml_file = _find_one(folder, "*.toml")
         if not toml_file:
-            raise FileNotFoundError("No TOML file found in the folder.")
-        
-        # Read TOML file
+            raise FileNotFoundError(
+                "No TOML file found in the input directory."
+                )
+
         cfg = _read_toml(toml_file)
         raw = cfg.get("raw_csr", {})
         params = cfg.get("params", {})
 
-        # Filenames (fall back to defaults if missing)
-        indptr_name  = raw.get("indptr_file", indptr)
+        # Resolve file names (TOML overrides defaults)
+        indptr_name = raw.get("indptr_file", indptr)
         indices_name = raw.get("indices_file", indices)
-        data_name    = raw.get("data_file",   data)
+        data_name = raw.get("data_file", data)
 
-        # Dtypes from TOML (fall back to your writer defaults)
-        indptr_dtype  = _DTYPE_MAP.get(raw.get("indptr_dtype", "int64"),  
-                                       np.int64)
-        indices_dtype = _DTYPE_MAP.get(raw.get("indices_dtype", "int32"),
-                                       np.int32)
-        data_dtype    = _DTYPE_MAP.get(raw.get("data_dtype",   "int32"),
-                                       np.int32)
+        # ---- Resolve dtypes
+        indptr_dtype = _DTYPE_MAP.get(
+            raw.get("indptr_dtype", "int64"), 
+            np.int64
+            )
+        indices_dtype = _DTYPE_MAP.get(
+            raw.get("indices_dtype", "int32"), 
+            np.int32
+            )
+        data_dtype = _DTYPE_MAP.get(
+            raw.get("data_dtype", "int32"), 
+            np.int32
+            )
 
-        # Shapes (nav_shape = [H, W], sig_shape = [Hdet, Wdet]) 
         nav_shape = params.get("nav_shape", None)
         sig_shape = params.get("sig_shape", None)
 
-        # Resolve full paths
-        indptr_path  = os.path.join(folder, indptr_name)
+        indptr_path = os.path.join(folder, indptr_name)
         indices_path = os.path.join(folder, indices_name)
-        data_path    = os.path.join(folder, data_name)
+        data_path = os.path.join(folder, data_name)
 
         for p in (indptr_path, indices_path, data_path):
             if not os.path.exists(p):
                 raise FileNotFoundError(f"Missing CSR file: {p}")
 
-        # Map files (no copy)
-        indptr  = np.memmap(indptr_path,  mode="r", dtype=indptr_dtype)
-        indices = np.memmap(indices_path, mode="r", dtype=indices_dtype)
-        values  = np.memmap(data_path,    mode="r", dtype=data_dtype)
+        # ---- Memory map (no copy)
+        indptr_mm = np.memmap(
+            indptr_path, 
+            mode="r", 
+            dtype=indptr_dtype
+            )
+        indices_mm = np.memmap(
+            indices_path, 
+            mode="r", 
+            dtype=indices_dtype
+            )
+        values_mm = np.memmap(
+            data_path, 
+            mode="r", 
+            dtype=data_dtype
+            )
 
-        # Prefetch (optional)
         if progress:
-            self._prefetch_memmap(indptr,  "Prefetch indptr",  
-                                  prefetch_mb, position=0)
-            self._prefetch_memmap(indices, "Prefetch indices", 
-                                  prefetch_mb, position=1)
-            self._prefetch_memmap(values,  "Prefetch values",  
-                                  prefetch_mb, position=2)
-
-        # CSR sanity
-        if indptr.shape[0] < 2:
-            raise ValueError("indptr must have length >= 2 (n_frames+1).")
-        nnz = int(indptr[-1])
-        if nnz != indices.size or nnz != values.size:
-            raise ValueError(
-                f"CSR mismatch: indptr[-1]={nnz}, len(indices)={indices.size}, len(values)={values.size}")
-
-        n_frames = indptr.shape[0] - 1
-        
-        # Build descriptors (offset, packet_count)
-        desc = np.empty(n_frames, dtype=BIN_DESCRIPTOR_DTYPE)
-        # offset is the row pointer (start index into indices/values)
-        desc["offset"] = indptr[:-1].astype(np.uint64, copy=False)
-        # packet_count is the difference of row pointers
-        row_counts = (indptr[1:] - indptr[:-1])
-        if np.any(row_counts < 0):
-            raise ValueError("indptr must be non-decreasing.")
-        if np.any(row_counts > np.iinfo(np.uint32).max):
-            raise ValueError("A row has >2^32-1 packets; no fit into uint32.")
-        desc["packet_count"] = row_counts.astype(np.uint32, copy=False)
-        
-        self.desc = desc
-
-        # Build packets (address, count, itot)
-        pkt = np.empty(nnz, dtype=ACQ_DATA_PACKET_DTYPE)
-        pkt["address"] = indices.astype(np.uint32, copy=False)
-        if values_role == "count":
-            pkt["count"] = values.astype(np.uint32, copy=False)
-            pkt["itot"]  = 0
-        elif values_role == "itot":
-            pkt["itot"]  = values.astype(np.uint32, copy=False)
-            pkt["count"] = 0
-        else:
-            raise ValueError("values_role must be 'count' or 'itot'")
-        
-        self.pkt = pkt
-
-        # Optional detector bounds check if sig_shape provided
-        if sig_shape:
-            Hdet, Wdet = int(sig_shape[0]), int(sig_shape[1])
-            det_max = Hdet * Wdet
-            if det_max > 0 and pkt["address"].max(initial=0) >= det_max:
-                raise ValueError(
-                    f"Some packet addresses exceed detector size {sig_shape}: "
-                    f"max address={int(pkt['address'].max())}, limit={det_max-1}"
+            self._prefetch_memmap(
+                indptr_mm, 
+                "Prefetch indptr", 
+                prefetch_mb, 
+                position=0
+                )
+            self._prefetch_memmap(
+                indices_mm, 
+                "Prefetch indices", 
+                prefetch_mb, 
+                position=1
+                )
+            self._prefetch_memmap(
+                values_mm, 
+                "Prefetch values", 
+                prefetch_mb, 
+                position=2
                 )
 
-        # Optional nav size check (frames = H*W)
-        if nav_shape:
-            H, W = int(nav_shape[0]), int(nav_shape[1])
-            if H * W != n_frames:
+        # ---- CSR sanity
+        if indptr_mm.shape[0] < 2:
+            raise ValueError("indptr must have length >= 2 (n_frames + 1).")
+
+        nnz = int(indptr_mm[-1])
+        if nnz != indices_mm.size or nnz != values_mm.size:
+            raise ValueError(
+                f"CSR mismatch: indptr[-1]={nnz}, ",
+                " len(indices)={indices_mm.size}, len(values)={values_mm.size}"
+            )
+
+        n_frames = int(indptr_mm.shape[0] - 1)
+
+        # ---- Build descriptors
+        descriptors = np.empty(n_frames, dtype=BIN_DESCRIPTOR_DTYPE)
+        descriptors["offset"] = indptr_mm[:-1].astype(np.uint64, copy=False)
+
+        row_counts = (indptr_mm[1:]-indptr_mm[:-1]).astype(np.int64, copy=False)
+        
+        if np.any(row_counts < 0):
+            raise ValueError("indptr must be non-decreasing.")
+            
+        if np.any(row_counts > np.iinfo(np.uint32).max):
+            raise ValueError(
+                "A row has >2^32-1 packets; cannot fit into uint32.")
+
+        descriptors["packet_count"] = row_counts.astype(np.uint32, copy=False)
+
+        # ---- Build packets
+        packets = np.empty(nnz, dtype=ACQ_DATA_PACKET_DTYPE)
+        packets["address"] = indices_mm.astype(np.uint32, copy=False)
+
+        values_role = str(values_role).lower()
+        if values_role == "count":
+            packets["count"] = values_mm.astype(np.uint32, copy=False)
+            packets["itot"] = 0
+        elif values_role == "itot":
+            packets["itot"] = values_mm.astype(np.uint32, copy=False)
+            packets["count"] = 0
+        else:
+            raise ValueError("values_role must be 'count' or 'itot'")
+
+        # ---- Optional: validate against detector bounds (if provided)
+        if sig_shape:
+            hdet, wdet = int(sig_shape[0]), int(sig_shape[1])
+            det_size = hdet * wdet
+            if det_size > 0 and packets["address"].max(initial=0) >= det_size:
                 raise ValueError(
-                    f"nav_shape {nav_shape} implies {H*W} frames, but indptr gives {n_frames} frames.")
+                    f"Some packet addresses exceed detector size {sig_shape}: "
+                    f"max={int(packets['address'].max())}, limit={det_size-1}"
+                )
 
-        # Compose a friendly header
-        header = self._normalize_header(cfg, indptr, indices, values)
+        # ---- Optional: validate nav shape
+        if nav_shape:
+            h, w = int(nav_shape[0]), int(nav_shape[1])
+            if h * w != n_frames:
+                raise ValueError(
+                    f"nav_shape {nav_shape} implies {h*w} frames,",
+                    f" but indptr gives {n_frames} frames."
+                )
 
-        return (pkt, desc, header) if return_header else (pkt, desc, None)
+        header = self._normalize_header(cfg, indptr_mm, indices_mm, values_mm)
+        return (packets, descriptors, header) if return_header else (packets, descriptors, None)
+
         
         
     def _prefetch_memmap(self,
@@ -456,7 +592,7 @@ class Timepix3:
         itemsize = mm.dtype.itemsize
         total = int(mm.shape[0])
         
-        # Convert the desired block size from megabytes to "number of elements".
+        # Convert the desired block size from megabytes to "number of elements"
         # Each element may be multi-byte (mm.dtype.itemsize).
         block_elems = max(1, (block_mb * 1024 * 1024) // itemsize)    
         
@@ -491,11 +627,14 @@ class Timepix3:
               "sig_shape", and optionally "threshold", "bias", "dwell_time_ns", 
               "values_role".
             - raw_cfg["raw_csr"]: file/dtype fields for indptr/indices/data.
+            
         indptr : np.ndarray or np.memmap, shape (n_frames+1,)
             CSR row pointer; must be non-decreasing. The last element equals 
             nnz.
+            
         indices : np.ndarray or np.memmap, shape (nnz,)
             CSR column indices (detector linear addresses).
+            
         values : np.ndarray or np.memmap, shape (nnz,)
             CSR values (counts or itot).
     
@@ -583,18 +722,7 @@ class Timepix3:
         
     
     def print_csr_header(self, h):
-        """
-        Pretty-print a CSR header/stats dict built by `_normalize_header`.
-
-        Parameters
-        ----------
-        h : dict
-            The header/stats dictionary.
-
-        Returns
-        -------
-        None
-        """
+        """ Print a CSR header/stats dict built by `_normalize_header`. """
         
         # Safe getters with defaults
         g = lambda k, d=None: h.get(k, d)
@@ -658,12 +786,16 @@ class Timepix3:
         ----------
         packets : numpy.ndarray
             The raw packet data from the .advb file.
+            
         descriptors : numpy.ndarray
             The descriptor data from the .advb.desc file.
+       
         pattern_index : integer
             Index of the diffractogram to be reconstructed.
+        
         scan_dims : tuple, optional
             The (width, height) of the overall scan grid.
+        
         detector_dims : tuple, optional
             The (width, height) of the detector.
     
@@ -673,14 +805,16 @@ class Timepix3:
             A 2D array (256x256) representing the diffraction pattern.
             
         """
-        # --- sanity on dims ---
+        # sanity on dims
         if (not isinstance(scan_dims, (tuple, list))) or len(scan_dims) != 2:
             raise TypeError(
                 f"scan_dims must be (width,height), got {scan_dims}")
+            
         if (not isinstance(detector_dims, (tuple, list))) or \
             len(detector_dims) != 2:
             raise TypeError(
                 f"detector_dims must be (width,height), got {detector_dims}")
+            
         if not isinstance(pattern_index, int):
             raise TypeError("pattern_index must be an integer.")
     
@@ -741,83 +875,6 @@ class Timepix3:
     
         count_sum = int(img.sum())
         return img, count_sum
-
-
-    def get_diffractogram_backup(self, 
-              packets, descriptors, pattern_index, scan_dims=(1024, 768), 
-              detector_dims=(256, 256), dtype=np.uint32):
-        """
-        Recovers the 2D diffraction pattern for a single pixel of the scan 
-        image.
-    
-        Parameters
-        ----------
-        packets : numpy.ndarray
-            The raw packet data from the .advb file.
-        descriptors : numpy.ndarray
-            The descriptor data from the .advb.desc file.
-        pattern_index : integer
-            Index of the diffractogram to be reconstructed.
-        scan_dims : tuple, optional
-            The (width, height) of the overall scan grid.
-        detector_dims : tuple, optional
-            The (width, height) of the detector.
-    
-        Returns
-        -------
-        numpy.ndarray
-            A 2D array (256x256) representing the diffraction pattern.
-            
-        """
-        #  Input Validation (Robustness Check) 
-        if not isinstance(scan_dims, (tuple, list)) or len(scan_dims) != 2:
-            raise TypeError(
-                f"scan_dims must be a tuple of (width, height), but got {scan_dims}")
-        if not isinstance(detector_dims, (tuple, list)) \
-            or len(detector_dims) != 2:
-            raise TypeError(
-                f"detector_dims must be a tuple of (width, height), but got {detector_dims}")
-        if not isinstance(pattern_index, int):
-            raise TypeError("pattern_index must be an integer.")
-    
-        scan_width, scan_height = scan_dims
-        det_width, det_height = detector_dims
-        
-        # Calculate the linear index for the desired scan pixel 
-        if not (0 <= pattern_index < len(descriptors)):
-            raise IndexError("Pattern index is out of bounds.")
-        
-        # Get the specific descriptor for this frame 
-        descriptor = descriptors[pattern_index]
-        frame_offset = descriptor["offset"]
-        frame_packet_count = descriptor["packet_count"]
-    
-        # Extract relevant packets
-        # frame_packets contains all the raw measurement data for that single 
-        # diffraction pattern at position (scan_x, scan_y).
-        frame_packets = packets[frame_offset:frame_offset + frame_packet_count]
-    
-        # Create a blank canvas for the diffraction pattern 
-        diffraction_image = np.zeros(detector_dims, dtype=dtype)
-    
-        # Reconstruct the diffraction pattern 
-        # populate the canvas with diffractions using the address and count
-        # the 'address' is a flattened 1D index for the 256x256 detector grid
-        detector_addresses = frame_packets["address"]
-        detector_counts = frame_packets[self.values_role]
-    
-        # Convert the 1D address to 2D (y, x) coordinates on the detector 
-        det_y = detector_addresses // det_width
-        det_x = detector_addresses % det_width
-    
-        # Place the counts at the correct locations
-        np.add.at(diffraction_image, (det_y, det_x), detector_counts)
-        
-        # Sum diffractogram
-        count_sum = np.sum(np.sum(diffraction_image))
-        
-        # Return diffractogram 
-        return diffraction_image, count_sum
 
 
     def get_count_itot(self,
@@ -931,13 +988,6 @@ class Timepix3:
             return count_image, itot_image
     
     
-
-            
-            
-    def ADVBLoader(self):
-        # place holder 
-        pass   
-    
 class Timepix1:
-    # place holder
+    """place holder"""
     pass

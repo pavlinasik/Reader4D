@@ -1,9 +1,85 @@
-# -*- coding: utf-8 -*-
 """
-Created on Thu Jan 22 08:34:05 2026
+Visualization utilities for 4D-STEM datasets handled by Reader4D.
 
-@author: p-sik
+This module focuses on two common storage layouts:
+
+1) Dense HDF5 stacks
+   A conventional HDF5 dataset containing full detector images per frame::
+
+       /data   shape = (n_frames, Hdet, Wdet)
+       # or sometimes a single frame: (Hdet, Wdet)
+
+2) Sparse Timepix3-style HDF5 (CSR-like)
+   A packet/descriptor representation storing only nonzero events::
+
+       /packets/address        (uint32)  linear detector pixel indices
+       /packets/count          (uint32)  per-event counts
+       /packets/itot           (uint32)  per-event iToT
+       /descriptors/offset     (uint64)  1st index into packets for each frame
+       /descriptors/packet_count (uint32) number of packets for each frame
+       optional /header_json   (UTF-8 JSON string; may include "sig_shape")
+
+The functions in this module provide:
+- Quick inspection of diffractograms by reconstructing them from sparse packets
+- Display utilities for scan-space micrographs
+- Automatic visualization of either dense or sparse HDF5 files, inferred from
+  the HDF5 group/dataset structure
+
+Conventions
+-----------
+- NumPy image arrays are displayed with shape ``(H, W)`` (rows, columns).
+- Packet ``address`` is assumed to be a *linear* index into the detector plane
+  in the range ``0 .. (Wdet * Hdet - 1)``. If your acquisition encodes 
+  addresses differently, you must decode/convert them before accumulation.
+
+Quick start
+-----------
+Show a random subset of diffractograms from in-memory sparse arrays::
+
+    import Reader4D.visualizer as r4dVisu
+
+    last_img, sums = r4dVisu.show_random_diffractograms(
+        packets, descriptors,
+        num_patterns=6, rows=2, cols=3,
+        detector_dims=(256, 256),
+        values_field="count",
+        percentile=(1, 99),
+    )
+
+Display a frame from an HDF5 file (dense *or* sparse layout)::
+
+    r4dVisu.show_dense_frame(
+        "dataset.h5",
+        index=0,
+        dense_dataset="data",
+        values_field="count",
+        det_dim=(256, 256),
+        percentile=(1, 99),
+    )
+
+Lazy reconstruction from HDF5 handles (avoids loading full arrays into memory)::
+
+    import Reader4D.convertor as r4dConv
+
+    f, gP, gD, header = r4dConv.load_sparse("sparse.h5", lazy=True)
+    try:
+        img = r4dVisu.get_diffractogram_lazy(
+            gP, gD,
+            pattern_index=0,
+            detector_dims=(256, 256),
+            values_field="count",
+        )
+    finally:
+        f.close()
+
+Functions
+---------
+- :func:`show_random_diffractograms` reconstructs and displays random patterns.
+- :func:`show_micrograph` displays (and optionally saves) scan-space images.
+- :func:`show_dense_frame` displays one frame from dense or sparse HDF5 inputs.
+- :func:`get_diffractogram_lazy` reconstructs one frame from HDF5 handles.
 """
+
 import matplotlib.pyplot as plt
 import h5py
 import numpy as np
@@ -27,6 +103,50 @@ def show_random_diffractograms(
     values_field="count",
     percentile=(1, 99),            # better default for display
 ):
+    """
+    Display a random subset of diffractograms reconstructed from sparse packets
+
+    Parameters
+    ----------
+    packets, descriptors : numpy.ndarray
+        Sparse dataset representation. ``packets`` must include ``address`` 
+        and the chosen ``values_field``; ``descriptors`` must include ``offset`` 
+        and ``packet_count``.
+   
+    scan_dims : tuple[int, int], optional
+        Scan grid size as (width, height). Used only for context/validation.
+    
+    num_patterns : int, optional
+        Number of random patterns to show.
+    
+    rows, cols : int, optional
+        Subplot grid layout.
+    
+    csquare : int, optional
+        Central crop size (pixels) used for display.
+    
+    icut : int or None, optional
+        If set, clip intensities to this maximum before display.
+    
+    detector_dims : tuple[int, int], optional
+        Detector size as (width, height).
+    
+    values_field : {"count", "itot"}, optional
+        Packet field to visualize.
+    
+    percentile : tuple[int, int] or None, optional
+        Percentile contrast scaling for display; set to None for linear scaling
+        
+
+    Returns
+    -------
+    last_img : numpy.ndarray or None
+        The last reconstructed full diffractogram (not cropped).
+        
+    sums : list[float]
+        List of intensity sums for each displayed pattern.
+    """
+    
     if rows * cols < num_patterns:
         num_patterns = rows * cols
 
@@ -102,16 +222,22 @@ def show_micrograph(img,
     ----------
     img : 2D array
         Image to display.
+   
     title : str
         Title for the plot.
+    
     cmap : str
         Colormap to use.
+    
     save : bool
         If True, save the image.
+    
     filename : str
         Filename to save as (e.g. "filtered.png").
+    
     output_dir : str
         Directory where to save the image.
+    
     show : bool
         If True, display the image.
     """
