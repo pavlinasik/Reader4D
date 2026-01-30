@@ -305,12 +305,13 @@ class Timepix3:
                     "[INFO] Reconstructing Hit Count and iToT micrographs..."
                     )
     
-            self.count, self.itot = self.get_count_itot(
+            self.count, self.itot = get_count_itot(
                 packets=self.packets,
                 descriptors=self.descriptors,
+                out_dir=self.out_dir,
                 scan_dims=self.scan_dims if \
                     self.scan_dims is not None else (1024, 768),
-                show=bool(show),
+                show=bool(self.show),
                 cmap=cmap,
             )
     
@@ -877,115 +878,117 @@ class Timepix3:
         return img, count_sum
 
 
-    def get_count_itot(self,
-                       packets, 
-                       descriptors, 
-                       scan_dims, 
-                       show=True, 
-                       cmap="gray"):
-        """
-        Constructs 2D images of total counts and iToT from raw data and 
-        descriptors.
+def get_count_itot(
+                   packets, 
+                   descriptors, 
+                   scan_dims, 
+                   out_dir,
+                   show=True, 
+                   cmap="gray",
+                   ):
+    """
+    Constructs 2D images of total counts and iToT from raw data and 
+    descriptors.
+
+    Parameters
+    ----------
+    packets : numpy.ndarray
+        The raw packet data from the .advb file.
+    descriptors : numpy.ndarray
+        The descriptor data from the .advb.desc file.
+    scan_dims : tuple (width, height) 
+        Scan size specifications (dimensions of the micrograph)
+    show : boolean
+        Display reconstructed images. Default is True.
+    cmap : string
+        Colormap of the displayed images, used when show=True.
+        Default is gray.
+
+    Returns
+    --------
+    count_image : numpy.ndarray 
+        Image of total event counts per pixel.
+    itot_image : numpy.ndarray 
+        Image of total iToT per pixel.
+    """
+    # Initialize dimensions
+    width, height = scan_dims
     
-        Parameters
-        ----------
-        packets : numpy.ndarray
-            The raw packet data from the .advb file.
-        descriptors : numpy.ndarray
-            The descriptor data from the .advb.desc file.
-        scan_dims : tuple (width, height) 
-            Scan size specifications (dimensions of the micrograph)
-        show : boolean
-            Display reconstructed images. Default is True.
-        cmap : string
-            Colormap of the displayed images, used when show=True.
-            Default is gray.
+    # Initialize arrays for inserting values from packets
+    count_image = np.zeros((height, width), dtype=np.uint32)
+    itot_image = np.zeros((height, width), dtype=np.uint32)
+
+    # Initialize counters
+    current_offset = 0
+    frame_idx = 0
     
-        Returns
-        --------
-        count_image : numpy.ndarray 
-            Image of total event counts per pixel.
-        itot_image : numpy.ndarray 
-            Image of total iToT per pixel.
-        """
-        # Initialize dimensions
-        width, height = scan_dims
+    # Iterate through descriptors and packets
+    for descriptor in descriptors:
+        # Find the starting point (offset in descriptors)
+        frame_start = current_offset
         
-        # Initialize arrays for inserting values from packets
-        count_image = np.zeros((height, width), dtype=np.uint32)
-        itot_image = np.zeros((height, width), dtype=np.uint32)
+        # Find the teminating point (offset + packet counts)
+        frame_end = frame_start + descriptor["packet_count"]
+        
+        # Extract all packets for the one pixel
+        frame_packets = packets[frame_start:frame_end]
+        
+        # Find the next starting point
+        current_offset += descriptor["packet_count"]
+        
+        # Get the coordinates of the pixel position within the array
+        frame_pos_x = frame_idx % width
+        frame_pos_y = frame_idx // width
+
+        if frame_pos_y < height:
+            # Hit count image
+            count_image[frame_pos_y, frame_pos_x] = \
+                np.sum(frame_packets["count"])
+            
+            # iToT image
+            itot_image[frame_pos_y, frame_pos_x] = \
+                np.sum(frame_packets["itot"])
+        
+        # Move to the next frame
+        frame_idx += 1
     
-        # Initialize counters
-        current_offset = 0
-        frame_idx = 0
-        
-        # Iterate through descriptors and packets
-        for descriptor in descriptors:
-            # Find the starting point (offset in descriptors)
-            frame_start = current_offset
-            
-            # Find the teminating point (offset + packet counts)
-            frame_end = frame_start + descriptor["packet_count"]
-            
-            # Extract all packets for the one pixel
-            frame_packets = packets[frame_start:frame_end]
-            
-            # Find the next starting point
-            current_offset += descriptor["packet_count"]
-            
-            # Get the coordinates of the pixel position within the array
-            frame_pos_x = frame_idx % width
-            frame_pos_y = frame_idx // width
-    
-            if frame_pos_y < height:
-                # Hit count image
-                count_image[frame_pos_y, frame_pos_x] = \
-                    np.sum(frame_packets["count"])
-                
-                # iToT image
-                itot_image[frame_pos_y, frame_pos_x] = \
-                    np.sum(frame_packets["itot"])
-            
-            # Move to the next frame
-            frame_idx += 1
-        
-        # Optionally display reconstructed images 
-        if show:
-            if np.sum(count_image) != 0:
-                r4dVisu.show_micrograph(
-                    count_image,
-                    title="Hit Counts Micrograph",
-                    cmap=cmap,
-                    save=False,
-                    filename=None,
-                    output_dir=self.out_dir,
-                    show=self.show
-                    )
-            else:
-                print("[INFO] Hit Counts not available.")
-                    
-            if np.sum(itot_image) != 0:
-                r4dVisu.show_micrograph(
-                    itot_image,
-                    title="iToT Micrograph",
-                    cmap=cmap,
-                    save=False,
-                    filename=None,
-                    output_dir=self.out_dir,
-                    show=self.show
-                    )
-            else:
-                print("[INFO] iToTs not available.")
-                
-                
-        if np.sum(count_image) == 0:
-            return None, itot_image
-        
-        elif np.sum(itot_image) == 0:
-            return count_image, None
-        
+    # Optionally display reconstructed images 
+    if show:
+        if np.sum(count_image) != 0:
+            r4dVisu.show_micrograph(
+                count_image,
+                title="Hit Counts Micrograph",
+                cmap=cmap,
+                save=False,
+                filename=None,
+                output_dir=out_dir,
+                show=show
+                )
         else:
-            return count_image, itot_image
+            print("[INFO] Hit Counts not available.")
+                
+        if np.sum(itot_image) != 0:
+            r4dVisu.show_micrograph(
+                itot_image,
+                title="iToT Micrograph",
+                cmap=cmap,
+                save=False,
+                filename=None,
+                output_dir=out_dir,
+                show=show
+                )
+        else:
+            print("[INFO] iToTs not available.")
+            
+            
+    if np.sum(count_image) == 0:
+        return None, itot_image
+    
+    elif np.sum(itot_image) == 0:
+        return count_image, None
+    
+    else:
+        return count_image, itot_image
     
     
 class Timepix1:
