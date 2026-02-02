@@ -551,3 +551,37 @@ def get_diffractogram(
         np.add.at(img.ravel(), addr, vals)
 
     return img
+
+
+def iter_events(packets, descriptors, nav_shape, sig_shape):
+    Hnav, Wnav = map(int, nav_shape)
+    Hdet, Wdet = map(int, sig_shape)
+
+    offsets = descriptors["offset"].astype(np.int64)
+    counts  = descriptors["packet_count"].astype(np.int64)
+    for i in range(counts.size):
+        s = offsets[i]
+        n = counts[i]
+        if n == 0:
+            continue
+
+        # probe coords
+        Y = i // Wnav
+        X = i %  Wnav
+
+        pkt = packets[s:s+n]
+        addr = pkt["address"].astype(np.int64, copy=False)
+
+        # detector coords
+        y = addr // Wdet
+        x = addr %  Wdet
+
+        # values
+        c = pkt["count"]
+        t = pkt["itot"]
+
+        # yield per-event arrays for this frame
+        # X and Y are scalars; x,y,c,t are length n
+        yield X, Y, x, y, c, t
+        
+        
