@@ -32,6 +32,7 @@ Notes
 import os
 import numpy as np
 import h5py
+import tifffile
 from tqdm import tqdm
 import Reader4D.detectors as det
 import json
@@ -169,7 +170,432 @@ def dat2hdf5(
     return out_file
 
 
+def _print_hdf5_structure(path):
+    """
+    Print the hierarchical structure of an HDF5 file.
+
+    The function is intended primarily for debugging and quick inspection
+    of the file schema rather than reading actual data values.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        Path to the HDF5 file.
+
+    Notes
+    -----
+    Groups are printed with a trailing "/" while datasets show their
+    shape and dtype.
+    """
+    def _print(name, obj):
+        indent = "  " * name.count("/")
+        if isinstance(obj, h5py.Dataset):
+            print(f"{indent}{name}  {obj.shape}  {obj.dtype}")
+        else:
+            print(f"{indent}{name}/")
+
+    print("\n[HDF5 STRUCTURE]")
+    with h5py.File(path, "r") as f:
+        f.visititems(_print)
+        
+
+def _tiff_header_to_dict(tiff_path):
+    """
+    Extract the header metadata of a TIFF file and convert it to a
+    JSON-serializable dictionary.
+    
+    The function reads the first TIFF page and collects all tag values
+    from its header. Because TIFF tag values may contain NumPy types,
+    byte strings, or arrays that are not directly JSON-serializable,
+    the values are converted into standard Python types.
+    
+    Conversion rules applied:
+    - byte strings → decoded UTF-8 strings
+    - NumPy arrays → Python lists
+    - NumPy scalars → native Python scalars
+    - tuples → lists
+    
+    In addition to standard TIFF tags, the function explicitly extracts
+    the ``ImageDescription`` tag (commonly used by microscope software
+    to store JSON/XML metadata) and stores it under the key
+    ``"_ImageDescription"``.
+    
+    Parameters
+    ----------
+    tiff_path : str or os.PathLike
+        Path to the TIFF file.
+    
+    Notes
+    -----
+    Only the first TIFF page is inspected. Multi-page TIFF files may
+    contain additional metadata in other pages which are not extracted
+    by this function.
+    
+    This helper is typically used to store experiment acquisition
+    metadata inside an HDF5 file (e.g. under ``/entry/experiment``).
+    """
+
+    with tifffile.TiffFile(tiff_path) as t:
+        page = t.pages[0]
+        tags = {}
+
+        for tag in page.tags.values():
+            v = tag.value
+
+            # JSON-serializable conversion
+            if isinstance(v, (bytes, bytearray, np.bytes_)):
+                try:
+                    v = v.decode("utf-8", errors="replace")
+                except Exception:
+                    v = repr(v)
+            elif isinstance(v, np.ndarray):
+                v = v.tolist()
+            elif isinstance(v, (np.integer, np.floating)):
+                v = v.item()
+            elif isinstance(v, tuple):
+                v = list(v)
+
+            tags[tag.name] = v
+
+        # common container for microscope metadata
+        img_desc = page.tags.get("ImageDescription")
+        if img_desc is not None:
+            v = img_desc.value
+            if isinstance(v, (bytes, bytearray, np.bytes_)):
+                v = v.decode("utf-8", errors="replace")
+            tags["_ImageDescription"] = v
+
+        return {"file": str(tiff_path), "page_index": 0, "tags": tags}
+
+        
 def csr2hdf5(
+    csr_path=None,
+    packets=None,
+    descriptors=None,
+    header=None,
+    output_path=r"./converted",
+    filename="data.h5",
+    overwrite=False,
+    progress=True,
+    chunk_events=2_000_000,
+    print_structure=False,
+    tiff=None,
+    *,
+    
+    # optional scan metadata
+    x_positions=None,           # (Nx,) float32
+    y_positions=None,           # (Ny,) float32
+    
+    #optional detector metadata
+    pixel_size=None,            # (2,) float32  [px, py] meters
+    distance=None,              # scalar float32 meters
+    beam_center=None,           # (2,) float32  [cx, cy] pixels
+    
+    #optional per-event mask
+    write_mask=False,
+    mask=None,    
+):
+    """
+    Convert sparse Timepix event data (CSR-style packets + descriptors)
+    into a structured HDF5 file using the /entry layout.
+    
+    The function writes detector events, scan metadata, detector metadata,
+    and experiment metadata into a single HDF5 file suitable for later
+    reconstruction or analysis of 4D-STEM / diffraction datasets.
+    
+    The output file follows this structure::
+
+        /entry
+            /events
+                x           (nnz,) int16      detector x-coordinate per event
+                y           (nnz,) int16      detector y-coordinate per event
+                address     (nnz,) uint32     flattened detector address
+                count       (nnz,) uint32     event count value
+                itot        (nnz,) uint32     integrated time-over-threshold
+                mask        (nnz,) uint8      per-event mask flag
+            /scan
+                shape       (2,) uint32       scan dimensions (Nx, Ny)
+                event_ptr   (n_frames+1,)     CSR index pointer
+                x_positions (Nx,) float32     probe x positions (optional)
+                y_positions (Ny,) float32     probe y positions (optional)
+            /detector
+                shape       (2,) uint16       detector dimensions (nx, ny)
+                pixel_size  (2,) float32      detector pixel size [m]
+                distance    () float32        sample-detector distance [m]
+                beam_center (2,) float32      beam center position [px]
+            /experiment
+                json                    experiment header metadata
+                tiff_header             optional TIFF metadata
+
+    Events are written in chunks to support very large datasets.
+    
+    Parameters
+    ----------
+    csr_path : str or None, optional
+        Reserved for future use. Intended path to a CSR file if direct
+        loading from disk is implemented.
+    
+    packets : numpy.ndarray
+        Structured array containing per-event information with fields:
+        ('address', 'count', 'itot').
+    
+    descriptors : numpy.ndarray
+        Structured array describing packet offsets for each scan position
+        with fields:
+        ('offset', 'packet_count').
+    
+    header : dict
+        Metadata dictionary describing the dataset. Must contain at least:
+        - ``nav_shape`` : tuple(int, int)
+            Scan shape (H, W) in navigation space.
+        - ``sig_shape`` : tuple(int, int)
+            Detector shape (Hdet, Wdet).
+    
+    output_path : str, optional
+        Directory where the HDF5 file will be written.
+    
+    filename : str, optional
+        Name of the output HDF5 file.
+    
+    overwrite : bool, optional
+        If True, overwrite existing files.
+    
+    progress : bool, optional
+        Display a progress bar during event writing.
+    
+    chunk_events : int, optional
+        Number of events written per chunk. Larger values improve
+        throughput but increase memory usage.
+        
+    print_structure : bool, optional
+        If True, print the resulting HDF5 file structure after writing.
+    
+    tiff : str or None, optional
+        Path to a TIFF file associated with the experiment. If provided,
+        its header metadata will be extracted and stored in the HDF5
+        file under ``/entry/experiment/tiff_header``.
+        
+    x_positions : array-like or None, optional
+        Physical x-coordinates of scan probe positions (Nx).
+    
+    y_positions : array-like or None, optional
+        Physical y-coordinates of scan probe positions (Ny).
+    
+    pixel_size : array-like or None, optional
+        Detector pixel size in meters (px, py).
+    
+    distance : float or None, optional
+        Sample-to-detector distance in meters.
+    
+    beam_center : array-like or None, optional
+        Direct beam position on detector in pixel coordinates (cx, cy).
+    
+    write_mask : bool, optional
+        If True, enable writing of a per-event mask dataset.
+    
+    mask : numpy.ndarray or None, optional
+        Array of mask flags per event. Must match the total number of events 
+        if provided.
+
+    
+    Returns
+    -------
+    str
+        Path to the generated HDF5 file.
+    
+
+    Notes
+    -----
+    The function assumes the detector address encoding follows
+    row-major ordering::
+    
+        address = y * Wdet + x
+    
+    Detector pixel coordinates are reconstructed during writing using::
+    
+        x = address % Wdet
+        y = address // Wdet
+    
+    The scan event mapping is stored using a CSR-style index array
+    ``event_ptr`` derived from descriptor packet counts.
+    """
+    
+    os.makedirs(output_path, exist_ok=True)
+    out_file = os.path.join(output_path, filename)
+
+
+    if os.path.exists(out_file) and not overwrite:
+        raise FileExistsError(
+            f"{out_file} already exists. Set overwrite=True.")
+
+    if packets is None or descriptors is None:
+        raise ValueError("Provide packets and descriptors.")
+    
+    if header is None:
+       raise ValueError("header is required (for nav_shape and sig_shape).")
+
+    # Header conventions in the codebase:
+    # (1) header["nav_shape"] = (H, W) (rows, cols)
+    # (2) header["sig_shape"] = (Hdet, Wdet)
+    nav_shape = tuple(map(int, header["nav_shape"]))  
+    sig_shape = tuple(map(int, header["sig_shape"]))  
+    Hnav, Wnav = nav_shape
+    Hdet, Wdet = sig_shape
+
+    n_frames = int(descriptors.shape[0])
+    if Hnav * Wnav != n_frames:
+        raise ValueError(
+            f"nav_shape {nav_shape} implies {Hnav*Wnav} frames but descriptors has {n_frames}."
+        )
+        
+    # Build CSR indptr (event_ptr) from packet_count
+    pc = np.asarray(descriptors["packet_count"], dtype=np.uint64)
+    event_ptr = np.empty(n_frames + 1, dtype=np.uint64)
+    event_ptr[0] = 0
+    if n_frames:
+        np.cumsum(pc, out=event_ptr[1:])
+
+    nnz = int(event_ptr[-1])
+    if nnz != int(packets.shape[0]):
+        raise ValueError(
+            f"Mismatch: event_ptr[-1]={nnz} but packets has {packets.shape[0]} rows.")
+
+    # Source arrays
+    addr_src  = packets["address"]  # flattened detector index (Timepix address)
+    count_src = packets["count"]
+    itot_src  = packets["itot"]
+    
+    # Tiff header
+    if tiff:
+        tiffheader = _tiff_header_to_dict(tiff)
+    else:
+        tiffheader = None
+    
+    # Dataset creation kwargs
+    ds_kwargs = dict(chunks=True)
+    
+    # Write file
+    with h5py.File(out_file, "w") as f:
+        entry = f.create_group("entry")
+        
+        # /ENTRY/EVENTS
+        gE=entry.create_group("events")
+        d_x=gE.create_dataset("x", shape=(nnz,),dtype=np.int16,**ds_kwargs)
+        d_y=gE.create_dataset("y", shape=(nnz,),dtype=np.int16,**ds_kwargs)
+        d_a=gE.create_dataset("address",shape=(nnz,),dtype=np.uint32,**ds_kwargs)
+        d_c=gE.create_dataset("count",shape=(nnz,),dtype=np.uint32,**ds_kwargs)
+        d_t=gE.create_dataset("itot",shape=(nnz,),dtype=np.uint32,**ds_kwargs)        
+        d_m=gE.create_dataset("mask",shape=(nnz,),dtype=np.uint8,**ds_kwargs)
+        
+        # /ENTRY/SCAN
+        gS = entry.create_group("scan")
+        gS.create_dataset("shape",data=np.array([Wnav, Hnav],dtype=np.uint32))
+        gS.create_dataset("event_ptr",data=event_ptr,dtype=np.uint64,**ds_kwargs)
+        
+        # x_positions
+        if x_positions is None:
+            x_positions = np.full(Wnav, np.nan, dtype=np.float32)
+        else:
+            x_positions = np.asarray(x_positions, dtype=np.float32)
+        
+        gS.create_dataset("x_positions", data=x_positions, dtype=np.float32)
+        
+        # y_positions
+        if y_positions is None:
+            y_positions = np.full(Hnav, np.nan, dtype=np.float32)
+        else:
+            y_positions = np.asarray(y_positions, dtype=np.float32)
+        
+        gS.create_dataset("y_positions", data=y_positions, dtype=np.float32)
+
+        
+        # /ENTRY/DETECTOR
+        gD = entry.create_group("detector")
+        gD.create_dataset("shape", data=np.array([Wdet, Hdet],dtype=np.uint16))
+        
+        # pixel_size
+        if pixel_size is None:
+            pixel_size = np.array([np.nan, np.nan], dtype=np.float32)
+        else:
+            pixel_size = np.asarray(pixel_size, dtype=np.float32)
+        
+        gD.create_dataset("pixel_size", data=pixel_size)
+        
+        # distance
+        if distance is None:
+            distance = np.float32(np.nan)
+        else:
+            distance = np.float32(distance)
+        
+        gD.create_dataset("distance", data=distance)
+        
+        # beam_center
+        if beam_center is None:
+            beam_center = np.array([np.nan, np.nan], dtype=np.float32)
+        else:
+            beam_center = np.asarray(beam_center, dtype=np.float32)
+        
+        gD.create_dataset("beam_center", data=beam_center)
+
+        # /ENTRY/EXPERIMENT/JSON
+        gX = entry.create_group("experiment")
+        gX.create_dataset("json", data=np.bytes_(json.dumps(header)))
+
+        # store TIFF header as JSON bytes (HDF5-safe)
+        if tiffheader is None:
+            gX.create_dataset("tiff_header", data=np.bytes_(b""))
+        else:
+            gX.create_dataset("tiff_header", 
+                              data=np.bytes_(json.dumps(tiffheader)))
+        
+        # Write events
+        it = range(0, nnz, chunk_events)
+        if progress:
+            try:
+                from tqdm import tqdm
+                it = tqdm(it, desc="Writing events", unit="ev")
+            except Exception:
+                pass
+
+        Wdet_i64 = np.int64(Wdet)
+
+        for start in it:
+            stop = min(start + chunk_events, nnz)
+
+            a = np.asarray(addr_src[start:stop], dtype=np.int64)
+            
+            # bounds check chunk (optional but safe)
+            if a.size and (a.max(initial=0)>=Hdet*Wdet or a.min(initial=0)<0):
+                raise ValueError("Address bounds check failed in chunk.")
+            
+            # decode x, y (detector pixel coordinates)
+            x = (a % Wdet_i64).astype(np.int16, copy=False)
+            y = (a // Wdet_i64).astype(np.int16, copy=False)
+
+            d_a[start:stop] = a.astype(np.uint32, copy=False)
+            d_x[start:stop] = x
+            d_y[start:stop] = y
+            d_c[start:stop] = np.asarray(count_src[start:stop], 
+                                         dtype=np.uint32, copy=False)
+            d_t[start:stop] = np.asarray(itot_src[start:stop],  
+                                         dtype=np.uint32, copy=False)
+            
+            if mask is not None:
+                d_m[start:stop] = mask[start:stop]
+            else:
+                d_m[start:stop] = 0
+    
+    if progress:
+        print(f"[INFO] Wrote /entry layout HDF5: {out_file}")
+    
+    if print_structure:
+        _print_hdf5_structure(out_file)
+    
+
+    return out_file
+
+
+def _csr2hdf5(
         csr_path=None,
         packets=None, 
         descriptors=None, 
@@ -314,8 +740,102 @@ def csr2hdf5(
 
     return out_file
     
-                
+
 def load_sparse(path, lazy=False, progress=True):
+    """
+    Load /entry/... sparse file.
+    If lazy=True: returns (f, gE, gS, gD, header) and caller must close f.
+    If lazy=False: materializes to structured packets + descriptors (RAM heavy).
+    If lazy=="semi": loads descriptors into RAM but keeps events lazy.
+    """
+
+    f = h5py.File(path, "r")
+
+    # ---- header/metadata
+    header = None
+    if "entry/experiment/json" in f:
+        raw = f["entry/experiment/json"][()]
+        if isinstance(raw, (bytes, bytearray, np.bytes_)):
+            raw = raw.decode("utf-8")
+        header = json.loads(raw)
+
+    gE = f["entry/events"]
+    gS = f["entry/scan"]
+    gD = f["entry/detector"]
+
+    if lazy is True:
+        if progress:
+            print("[INFO] Entry sparse data loaded as handles (lazy access).")
+            print("[INFO] The file handle must be closed after use.")
+        return f, gE, gS, gD, header
+
+    # ---- geometry (small)
+    det_shape = tuple(map(int, gD["shape"][...]))  # (nx, ny)
+    nx, ny = det_shape
+
+    event_ptr = gS["event_ptr"][...].astype(np.uint64, copy=False)
+    if event_ptr.ndim != 1 or event_ptr.size < 2:
+        f.close()
+        raise ValueError("entry/scan/event_ptr must be 1D with length >= 2.")
+
+    n_frames = int(event_ptr.size - 1)
+    nnz = int(event_ptr[-1])
+
+    packet_count = np.diff(event_ptr).astype(np.uint64, copy=False)
+    if packet_count.max(initial=0) > np.iinfo(np.uint32).max:
+        f.close()
+        raise ValueError("A frame has >2^32-1 events; cannot fit packet_count into uint32.")
+
+    # ---- "semi-lazy": descriptors in RAM, events stay on disk
+    if lazy == "semi":
+        descriptors = np.empty(n_frames, dtype=BIN_DESCRIPTOR_DTYPE)
+        descriptors["offset"] = event_ptr[:-1].astype(np.uint64, copy=False)
+        descriptors["packet_count"] = packet_count.astype(np.uint32, copy=False)
+
+        if progress:
+            print("[INFO] Semi-lazy load: descriptors in memory, events remain on disk.")
+            print("[INFO] Close the returned file handle after use.")
+
+        # return file + groups + descriptors
+        return f, gE, gS, gD, header, descriptors
+
+    # ---- materialize everything (RAM heavy)
+    # read event arrays
+    x = gE["x"][...].astype(np.int64, copy=False)
+    y = gE["y"][...].astype(np.int64, copy=False)
+    count = gE["count"][...]
+    itot  = gE["itot"][...]
+
+    if x.size != nnz or y.size != nnz:
+        f.close()
+        raise ValueError("events/x or events/y length does not match event_ptr[-1].")
+
+    # bounds check
+    if x.size:
+        if x.min() < 0 or x.max() >= nx or y.min() < 0 or y.max() >= ny:
+            f.close()
+            raise ValueError("Some (x,y) events are outside detector bounds.")
+
+    address = (y * nx + x).astype(np.uint32, copy=False)
+
+    packets = np.empty(nnz, dtype=ACQ_DATA_PACKET_DTYPE)
+    packets["address"] = address
+    packets["count"]   = count.astype(np.uint32, copy=False)
+    packets["itot"]    = itot.astype(np.uint32, copy=False)
+
+    descriptors = np.empty(n_frames, dtype=BIN_DESCRIPTOR_DTYPE)
+    descriptors["offset"] = event_ptr[:-1].astype(np.uint64, copy=False)
+    descriptors["packet_count"] = packet_count.astype(np.uint32, copy=False)
+
+    f.close()
+
+    if progress:
+        print("[INFO] Entry sparse data loaded as arrays into memory.")
+
+    return packets, descriptors, header
+
+           
+def _load_sparse(path, lazy=False, progress=True):
     """
     Load a sparse Timepix3 HDF5 file produced by :func:`csr2hdf5`.
 
