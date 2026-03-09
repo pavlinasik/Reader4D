@@ -26,7 +26,7 @@ import numpy as np
 import cv2
 import imageio
 from PIL import Image, ImageDraw, ImageFont
-import Virtual4D.virtDets as v4dVDet
+# import Virtual4D.virtDets as v4dVDet
 
 class Creator:
     """
