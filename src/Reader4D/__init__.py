@@ -27,42 +27,39 @@ Typical workflow
 ----------------
 Convert a folder of ``.dat`` frames to one HDF5 stack::
 
-    from Reader4D import convertor as r4dConv
-
-    out = r4dConv.dat2hdf5(
-        dat_path=r"C:\\path\\to\\DATA",
-        output_path=r".\\converted",
-        filename="dataset.h5",
-        det_dim=(256, 256),
-        overwrite=True
-    )
+    >>> from Reader4D import convertor as r4dConv
+    >>> 
+    >>> out = r4dConv.dat2hdf5(
+    >>>    dat_path=r"C:\\path\\to\\DATA",
+    >>>    output_path=r".\\converted",
+    >>>    filename="dataset.h5",
+    >>>    det_dim=(256, 256),
+    >>>    overwrite=True)
 
 Visualize a frame from a HDF5 stack::
-    from Reader4D import visualizer as r4dVisu
-    r4dVisu.show_dense_frame(
-        r".\\converted\\dataset.h5", 
-        index=0, 
-        percentile=(1, 99)
-        )
+    
+    >>> from Reader4D import visualizer as r4dVisu
+    >>> r4dVisu.show_dense_frame(
+    >>>    r".\\converted\\dataset.h5", 
+    >>>    index=0, 
+    >>>    percentile=(1, 99))
 
 Load sparse HDF5 lazily and reconstruct a single diffractogram::
 
-    from Reader4D import convertor as conv
-    from Reader4D import visualizer as visu
-
-    f, gP, gD, header = r4dConv.load_sparse(
-        "sparse_dataset.h5", 
-        lazy=True
-        )
-    try:
-        img = r4dVisu.get_diffractogram_lazy(
-            gP, gD,
-            pattern_index=0,
-            detector_dims=header["sig_shape"],
-            values_field="count"
-        )
-    finally:
-        f.close()
+    >>> from Reader4D import convertor as conv
+    >>> from Reader4D import visualizer as visu
+    >>> 
+    >>> f, gP, gD, header = r4dConv.load_sparse(
+    >>>     "sparse_dataset.h5", 
+    >>>     lazy=True)
+    >>> try:
+    >>>     img = r4dVisu.get_diffractogram_lazy(
+    >>>         gP, gD,
+    >>>         pattern_index=0,
+    >>>         detector_dims=header["sig_shape"],
+    >>>         values_field="count")
+    >>> finally:
+    >>>     f.close()
 
 Modules
 -------
